@@ -168,6 +168,7 @@
     <ClInclude Include="OpenAlgoPlugin.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Plugin.h" />
+    <ClInclude Include="OpenAlgoGlobals.h" />
     <ClInclude Include="Plugin_Legacy.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="StdAfx.h" />
@@ -180,6 +181,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="OpenAlgoPlugin.def" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="OpenAlgo.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
