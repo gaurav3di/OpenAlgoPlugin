@@ -11,5 +11,5 @@ EXPORTS
 	Notify
 	GetRecentInfo
 	GetSymbolLimit
-	GetPluginStatus
+	GetStatus
 	GetExtraData

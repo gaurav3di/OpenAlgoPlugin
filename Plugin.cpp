@@ -68,6 +68,11 @@ struct QuoteCache {
 	float volume;
 	float oi;
 	DWORD lastUpdate;
+	
+	// Constructor to initialize all values
+	QuoteCache() : ltp(0.0f), open(0.0f), high(0.0f), low(0.0f), 
+	               close(0.0f), volume(0.0f), oi(0.0f), lastUpdate(0) {
+	}
 };
 
 static CMap<CString, LPCTSTR, QuoteCache, QuoteCache&> g_QuoteCache;
@@ -295,7 +300,7 @@ BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote)
 
 							quote.symbol = symbol;
 							quote.exchange = exchange;
-							quote.lastUpdate = GetTickCount();
+							quote.lastUpdate = (DWORD)GetTickCount64();
 
 							bSuccess = TRUE;
 						}
@@ -345,8 +350,8 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 		// Determine how far back to request
 		if (nPeriodicity == 60) // 1-minute data
 		{
-			// For 1-minute data, get last 5 days
-			startTime -= CTimeSpan(5, 0, 0, 0);
+			// For 1-minute data, get last 3 days to ensure we have recent data
+			startTime -= CTimeSpan(3, 0, 0, 0);
 		}
 		else // Daily data
 		{
@@ -690,7 +695,7 @@ PLUGINAPI int GetSymbolLimit(void)
 }
 
 // CRITICAL FUNCTION - This makes the status LED work!
-PLUGINAPI int GetPluginStatus(struct PluginStatus* status)
+PLUGINAPI int GetStatus(struct PluginStatus* status)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
@@ -708,37 +713,37 @@ PLUGINAPI int GetPluginStatus(struct PluginStatus* status)
 	switch (g_nStatus)
 	{
 	case STATUS_WAIT:
-		status->nStatusCode = 0x10000000;
+		status->nStatusCode = 0x10000000; // WARNING
 		strcpy_s(status->szShortMessage, 32, "WAIT");
 		strcpy_s(status->szLongMessage, 256, "OpenAlgo: Waiting to connect");
 		status->clrStatusColor = RGB(255, 255, 0); // Yellow
 		break;
 
 	case STATUS_CONNECTED:
-		status->nStatusCode = 0x00000000;
+		status->nStatusCode = 0x00000000; // OK
 		strcpy_s(status->szShortMessage, 32, "OK");
 		strcpy_s(status->szLongMessage, 256, "OpenAlgo: Connected");
 		status->clrStatusColor = RGB(0, 255, 0); // Green
 		break;
 
 	case STATUS_DISCONNECTED:
-		status->nStatusCode = 0x20000000;
+		status->nStatusCode = 0x20000000; // MINOR ERROR
 		strcpy_s(status->szShortMessage, 32, "ERR");
-		strcpy_s(status->szLongMessage, 256, "OpenAlgo: Connection failed");
+		strcpy_s(status->szLongMessage, 256, "OpenAlgo: Connection failed. Will retry in 15 seconds.");
 		status->clrStatusColor = RGB(255, 0, 0); // Red
 		break;
 
 	case STATUS_SHUTDOWN:
-		status->nStatusCode = 0x30000000;
+		status->nStatusCode = 0x30000000; // SEVERE ERROR
 		strcpy_s(status->szShortMessage, 32, "OFF");
-		strcpy_s(status->szLongMessage, 256, "OpenAlgo: Offline");
+		strcpy_s(status->szLongMessage, 256, "OpenAlgo: Offline. Right-click to reconnect.");
 		status->clrStatusColor = RGB(192, 0, 192); // Purple
 		break;
 
 	default:
-		status->nStatusCode = 0x40000000;
+		status->nStatusCode = 0x30000000; // SEVERE ERROR
 		strcpy_s(status->szShortMessage, 32, "???");
-		strcpy_s(status->szLongMessage, 256, "Unknown status");
+		strcpy_s(status->szLongMessage, 256, "OpenAlgo: Unknown status");
 		status->clrStatusColor = RGB(128, 128, 128); // Gray
 		break;
 	}
@@ -1119,7 +1124,7 @@ PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 	if (g_QuoteCache.Lookup(ticker, cachedQuote))
 	{
 		// Use cached data if it's less than 5 seconds old
-		DWORD dwNow = GetTickCount();
+		DWORD dwNow = (DWORD)GetTickCount64();
 		if ((dwNow - cachedQuote.lastUpdate) < 5000)
 		{
 			bCached = TRUE;
