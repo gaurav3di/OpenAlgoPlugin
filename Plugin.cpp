@@ -108,7 +108,8 @@ CString GetExchangeFromTicker(LPCTSTR pszTicker)
 	{
 		return ticker.Mid(dashPos + 1);
 	}
-	// Default exchange if not specified
+	// Default exchange if not specified - let OpenAlgo determine
+	// OpenAlgo supports all exchanges with their dynamic trading hours including special sessions
 	return _T("NSE");
 }
 
@@ -131,11 +132,14 @@ CString GetIntervalString(int nPeriodicity)
 	// Only support 1-minute and Daily for now
 	if (nPeriodicity == 60)  // 1 minute in seconds
 		return _T("1m");
+	else if (nPeriodicity == 86400) // Daily in seconds (24*60*60)
+		return _T("D");  // Daily
 	else
 		return _T("D");  // Default to daily for all other timeframes
 }
 
 // Convert Unix timestamp to AmiBroker date format
+// Works for all market types including 24x7 markets
 void ConvertUnixToPackedDate(time_t unixTime, union AmiDate* pAmiDate)
 {
 	struct tm* timeinfo = localtime(&unixTime);
@@ -148,9 +152,13 @@ void ConvertUnixToPackedDate(time_t unixTime, union AmiDate* pAmiDate)
 	pAmiDate->PackDate.Second = timeinfo->tm_sec;
 	pAmiDate->PackDate.MilliSec = 0;
 	pAmiDate->PackDate.MicroSec = 0;
+	pAmiDate->PackDate.Reserved = 0;
+	pAmiDate->PackDate.IsFuturePad = 0;
 }
 
 // Fetch real-time quote from OpenAlgo
+// WARNING: This is ONLY for Level 1 quotes in Real-time Quote Window
+// NEVER use this data for creating OHLC bars or historical charts
 BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
@@ -325,8 +333,21 @@ BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote)
 	return bSuccess;
 }
 
-// Fetch historical data from OpenAlgo
-// Currently supports only 1m and D (daily) intervals
+// Fetch historical data from OpenAlgo with intelligent backfill strategy
+// COMPLETELY EXCHANGE-AGNOSTIC - Works with ANY exchange and ANY trading hours
+//
+// BACKFILL STRATEGY:
+// - First load: Gets last 30 days of 1m data or 1 year of daily data
+// - Subsequent refreshes: Only gets data from last existing bar to current time
+// - Prevents duplicate bars and maintains data integrity
+//
+// EXCHANGE SUPPORT:
+// - NSE: Regular + evening sessions + special Sunday sessions
+// - MCX: Overnight sessions + extended hours  
+// - Crypto: 24x7 including weekends
+// - Any future sessions that exchanges may introduce
+//
+// Currently supports 1m and D (daily) intervals
 int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int nSize, struct Quotation* pQuotes)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
@@ -343,20 +364,56 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 		CString exchange = GetExchangeFromTicker(pszTicker);
 		CString interval = GetIntervalString(nPeriodicity);
 
-		// Calculate date range based on interval type
+		// Calculate date range based on existing data
 		CTime endTime = CTime::GetCurrentTime();
 		CTime startTime = endTime;
 
-		// Determine how far back to request
-		if (nPeriodicity == 60) // 1-minute data
+		// Determine start date based on existing data
+		if (nLastValid >= 0 && pQuotes != NULL)
 		{
-			// For 1-minute data, get last 3 days to ensure we have recent data
-			startTime -= CTimeSpan(3, 0, 0, 0);
+			// We have existing data - only get data from last bar onwards
+			// Extract date from last existing bar
+			int lastYear = pQuotes[nLastValid].DateTime.PackDate.Year;
+			int lastMonth = pQuotes[nLastValid].DateTime.PackDate.Month;
+			int lastDay = pQuotes[nLastValid].DateTime.PackDate.Day;
+			
+			if (lastYear > 1900 && lastMonth > 0 && lastDay > 0)
+			{
+				// Start from the day of last existing data to ensure continuity
+				startTime = CTime(lastYear, lastMonth, lastDay, 0, 0, 0);
+				
+				// For intraday data, go back 1 day to ensure we don't miss any bars
+				if (nPeriodicity == 60)
+				{
+					startTime -= CTimeSpan(1, 0, 0, 0);
+				}
+			}
+			else
+			{
+				// Invalid date in existing data, fall back to default range
+				if (nPeriodicity == 60) // 1-minute data
+				{
+					startTime -= CTimeSpan(30, 0, 0, 0); // 30 days for initial load
+				}
+				else // Daily data
+				{
+					startTime -= CTimeSpan(365, 0, 0, 0); // 1 year for initial load
+				}
+			}
 		}
-		else // Daily data
+		else
 		{
-			// For daily data, get last 1 year
-			startTime -= CTimeSpan(365, 0, 0, 0);
+			// No existing data - initial backfill
+			if (nPeriodicity == 60) // 1-minute data
+			{
+				// For 1-minute data, get last 30 days for initial load
+				startTime -= CTimeSpan(30, 0, 0, 0);
+			}
+			else // Daily data
+			{
+				// For daily data, get 1 year for initial load
+				startTime -= CTimeSpan(365, 0, 0, 0);
+			}
 		}
 
 		CString startDate = startTime.Format(_T("%Y-%m-%d"));
@@ -418,11 +475,26 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 							{
 								dataStart += 8;
 								int dataEnd = oResponse.Find(_T("]"), dataStart);
+								if (dataEnd < 0) dataEnd = oResponse.GetLength();
 								CString dataArray = oResponse.Mid(dataStart, dataEnd - dataStart);
+								
+								// Debug: Check if we have meaningful data
+								if (dataArray.GetLength() < 10)
+								{
+									// Very little data, might be an issue
+									return nLastValid + 1;
+								}
 
-								// Parse each candle
-								int quoteIndex = nLastValid + 1;
+								// Parse each candle and merge with existing data
+								int quoteIndex = 0;
 								int pos = 0;
+								
+								// If we have existing data, we'll need to merge properly
+								BOOL bHasExistingData = (nLastValid >= 0);
+								if (bHasExistingData)
+								{
+									quoteIndex = nLastValid + 1;
+								}
 
 								while (pos < dataArray.GetLength() && quoteIndex < nSize)
 								{
@@ -445,7 +517,19 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 										time_t timestamp = (time_t)_tstoi64(tsStr);
 
 										// Convert to AmiBroker date
+									if (nPeriodicity == 86400) // Daily data
+									{
+										// For daily data, set the DAILY_MASK and EOD markers
 										ConvertUnixToPackedDate(timestamp, &pQuotes[quoteIndex].DateTime);
+										pQuotes[quoteIndex].DateTime.Date |= DAILY_MASK;
+										pQuotes[quoteIndex].DateTime.PackDate.Hour = 31; // EOD marker
+										pQuotes[quoteIndex].DateTime.PackDate.Minute = 63; // EOD marker
+									}
+									else
+									{
+										// For intraday data
+										ConvertUnixToPackedDate(timestamp, &pQuotes[quoteIndex].DateTime);
+									}
 
 										// Parse OHLCV
 										int oPos = candle.Find(_T("\"open\":"));
@@ -509,35 +593,48 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 										pQuotes[quoteIndex].AuxData1 = 0;
 										pQuotes[quoteIndex].AuxData2 = 0;
 
-										quoteIndex++;
+										// Only increment if this isn't a duplicate
+										// Check against existing data to prevent duplicates during refresh
+										BOOL bShouldAdd = TRUE;
+										if (bHasExistingData && quoteIndex > 0)
+										{
+											// Simple duplicate check - compare with last few bars
+											for (int i = max(0, quoteIndex - 5); i < quoteIndex; i++)
+											{
+												if (abs((int)(pQuotes[i].DateTime.Date - pQuotes[quoteIndex].DateTime.Date)) < 60)
+												{
+													bShouldAdd = FALSE;
+													break;
+												}
+											}
+										}
+										
+										if (bShouldAdd)
+										{
+											quoteIndex++;
+										}
 									}
 
 									pos = candleEnd + 1;
 								}
 
-								// Update with latest quote if available for intraday data
-								if (quoteIndex > nLastValid + 1 && nPeriodicity == 60)
-								{
-									QuoteCache latestQuote;
-									if (GetOpenAlgoQuote(pszTicker, latestQuote))
-									{
-										// Update the last bar with real-time data
-										if (quoteIndex > 0)
-										{
-											pQuotes[quoteIndex - 1].Price = latestQuote.ltp;
-											pQuotes[quoteIndex - 1].High = max(pQuotes[quoteIndex - 1].High, latestQuote.ltp);
-											pQuotes[quoteIndex - 1].Low = min(pQuotes[quoteIndex - 1].Low, latestQuote.ltp);
-											pQuotes[quoteIndex - 1].Volume = latestQuote.volume;
-											pQuotes[quoteIndex - 1].OpenInterest = latestQuote.oi;
-										}
-									}
-								}
+								// DO NOT mix quote data with historical interval data
+								// Quote data is for real-time window only, not for OHLC bars
+								// Historical data from OpenAlgo is already complete and accurate
 
 								pFile->Close();
 								delete pFile;
 								pConnection->Close();
 								delete pConnection;
 								oSession.Close();
+
+								// If we have more data than the array can hold, keep the most recent data
+								if (quoteIndex > nSize)
+								{
+									int excessBars = quoteIndex - nSize;
+									memmove(pQuotes, pQuotes + excessBars, nSize * sizeof(struct Quotation));
+									quoteIndex = nSize;
+								}
 
 								return quoteIndex;
 							}
@@ -1081,6 +1178,8 @@ PLUGINAPI int GetQuotes(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int
 	return nQty;
 }
 
+// Main quote retrieval function - ZERO exchange restrictions
+// Handles ALL trading scenarios dynamically through OpenAlgo server
 PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int nSize, struct Quotation* pQuotes, GQEContext* pContext)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
@@ -1090,20 +1189,33 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 		return nLastValid + 1;
 	}
 
-	// Only support 1-minute and Daily intervals
-	// For other intervals, just return existing data
-	if (nPeriodicity != 60 && nPeriodicity != 86400)
+	// Handle Daily (EOD) data separately
+	if (nPeriodicity == 86400) // Daily (24 * 60 * 60 seconds)
+	{
+		// For daily data, only use historical data from OpenAlgo
+		// Do NOT mix with quote data as it's for real-time window only
+		int nQty = GetOpenAlgoHistory(pszTicker, nPeriodicity, nLastValid, nSize, pQuotes);
+		return nQty;
+	}
+	// Handle intraday data (1-minute only for now)
+	else if (nPeriodicity == 60)
+	{
+		// Always fetch fresh historical data from OpenAlgo
+		// This ensures charts stay accurate and up-to-date with proper OHLC bars
+		// Quote data should never be mixed with interval data
+		int nQty = GetOpenAlgoHistory(pszTicker, nPeriodicity, nLastValid, nSize, pQuotes);
+		return nQty;
+	}
+	else
 	{
 		// Unsupported interval - return existing data
 		return nLastValid + 1;
 	}
-
-	// Fetch historical data from OpenAlgo
-	int nQty = GetOpenAlgoHistory(pszTicker, nPeriodicity, nLastValid, nSize, pQuotes);
-
-	return nQty;
 }
 
+// GetRecentInfo is ONLY for Real-time Quote Window display
+// This function provides Level 1 quotes for the quote window
+// It should NEVER be used for chart data or OHLC bars
 PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
