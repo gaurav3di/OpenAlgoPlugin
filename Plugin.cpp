@@ -338,8 +338,9 @@ BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote)
 //
 // BACKFILL STRATEGY:
 // - First load: Gets last 30 days of 1m data or 1 year of daily data
-// - Subsequent refreshes: Only gets data from last existing bar to current time
-// - Prevents duplicate bars and maintains data integrity
+// - Subsequent refreshes: Gets TODAY'S data only (start_date = end_date = today)
+// - Smart duplicate handling: Updates existing bars, adds only new bars
+// - Maintains data integrity and chart consistency
 //
 // EXCHANGE SUPPORT:
 // - NSE: Regular + evening sessions + special Sunday sessions
@@ -371,34 +372,15 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 		// Determine start date based on existing data
 		if (nLastValid >= 0 && pQuotes != NULL)
 		{
-			// We have existing data - only get data from last bar onwards
-			// Extract date from last existing bar
-			int lastYear = pQuotes[nLastValid].DateTime.PackDate.Year;
-			int lastMonth = pQuotes[nLastValid].DateTime.PackDate.Month;
-			int lastDay = pQuotes[nLastValid].DateTime.PackDate.Day;
+			// We have existing data - for refresh, only get TODAY'S data
+			// This ensures we get the latest bars for the current trading day
+			startTime = CTime(endTime.GetYear(), endTime.GetMonth(), endTime.GetDay(), 0, 0, 0);
 			
-			if (lastYear > 1900 && lastMonth > 0 && lastDay > 0)
+			// For daily data, we might want a bit more range
+			if (nPeriodicity == 86400) // Daily data
 			{
-				// Start from the day of last existing data to ensure continuity
-				startTime = CTime(lastYear, lastMonth, lastDay, 0, 0, 0);
-				
-				// For intraday data, go back 1 day to ensure we don't miss any bars
-				if (nPeriodicity == 60)
-				{
-					startTime -= CTimeSpan(1, 0, 0, 0);
-				}
-			}
-			else
-			{
-				// Invalid date in existing data, fall back to default range
-				if (nPeriodicity == 60) // 1-minute data
-				{
-					startTime -= CTimeSpan(30, 0, 0, 0); // 30 days for initial load
-				}
-				else // Daily data
-				{
-					startTime -= CTimeSpan(365, 0, 0, 0); // 1 year for initial load
-				}
+				// For daily data refresh, get last few days to ensure we have recent bars
+				startTime -= CTimeSpan(7, 0, 0, 0);
 			}
 		}
 		else
@@ -493,6 +475,7 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 								BOOL bHasExistingData = (nLastValid >= 0);
 								if (bHasExistingData)
 								{
+									// Start appending after existing data
 									quoteIndex = nLastValid + 1;
 								}
 
@@ -593,23 +576,49 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 										pQuotes[quoteIndex].AuxData1 = 0;
 										pQuotes[quoteIndex].AuxData2 = 0;
 
-										// Only increment if this isn't a duplicate
-										// Check against existing data to prevent duplicates during refresh
-										BOOL bShouldAdd = TRUE;
-										if (bHasExistingData && quoteIndex > 0)
+										// Check for duplicate timestamps against existing data
+										BOOL bIsDuplicate = FALSE;
+										if (bHasExistingData)
 										{
-											// Simple duplicate check - compare with last few bars
-											for (int i = max(0, quoteIndex - 5); i < quoteIndex; i++)
+											// Convert new bar timestamp for comparison
+											struct tm newBarTime;
+											newBarTime.tm_year = pQuotes[quoteIndex].DateTime.PackDate.Year - 1900;
+											newBarTime.tm_mon = pQuotes[quoteIndex].DateTime.PackDate.Month - 1;
+											newBarTime.tm_mday = pQuotes[quoteIndex].DateTime.PackDate.Day;
+											newBarTime.tm_hour = pQuotes[quoteIndex].DateTime.PackDate.Hour;
+											newBarTime.tm_min = pQuotes[quoteIndex].DateTime.PackDate.Minute;
+											newBarTime.tm_sec = pQuotes[quoteIndex].DateTime.PackDate.Second;
+											time_t newTimestamp = mktime(&newBarTime);
+											
+											// Check against existing bars (check reasonable range)
+											for (int i = max(0, nLastValid - 100); i <= nLastValid; i++)
 											{
-												if (abs((int)(pQuotes[i].DateTime.Date - pQuotes[quoteIndex].DateTime.Date)) < 60)
+												struct tm existingTime;
+												existingTime.tm_year = pQuotes[i].DateTime.PackDate.Year - 1900;
+												existingTime.tm_mon = pQuotes[i].DateTime.PackDate.Month - 1;
+												existingTime.tm_mday = pQuotes[i].DateTime.PackDate.Day;
+												existingTime.tm_hour = pQuotes[i].DateTime.PackDate.Hour;
+												existingTime.tm_min = pQuotes[i].DateTime.PackDate.Minute;
+												existingTime.tm_sec = pQuotes[i].DateTime.PackDate.Second;
+												time_t existingTimestamp = mktime(&existingTime);
+												
+												// If timestamps are within 1 minute, consider it duplicate
+												if (abs((int)(newTimestamp - existingTimestamp)) < 60)
 												{
-													bShouldAdd = FALSE;
+													bIsDuplicate = TRUE;
+													// Update existing bar with latest data instead of adding new
+													pQuotes[i].Price = pQuotes[quoteIndex].Price; // Close
+													pQuotes[i].High = max(pQuotes[i].High, pQuotes[quoteIndex].High);
+													pQuotes[i].Low = (pQuotes[i].Low == 0) ? pQuotes[quoteIndex].Low : min(pQuotes[i].Low, pQuotes[quoteIndex].Low);
+													pQuotes[i].Volume = pQuotes[quoteIndex].Volume;
+													pQuotes[i].OpenInterest = pQuotes[quoteIndex].OpenInterest;
 													break;
 												}
 											}
 										}
 										
-										if (bShouldAdd)
+										// Only add new bar if it's not a duplicate
+										if (!bIsDuplicate)
 										{
 											quoteIndex++;
 										}
