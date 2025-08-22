@@ -61,9 +61,13 @@ COpenAlgoApp::COpenAlgoApp()
 
 COpenAlgoApp theApp;
 
+/////////////////////////////////////////////////////////////////////////////
+// COpenAlgoApp initialization
+
 BOOL COpenAlgoApp::InitInstance()
 {
-	SetRegistryKey("TJP");
+	// Set the registry key for storing settings
+	SetRegistryKey(_T("OpenAlgo"));
 
 	return CWinApp::InitInstance();
 }

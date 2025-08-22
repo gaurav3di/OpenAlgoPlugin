@@ -25,8 +25,8 @@ public:
 	COpenAlgoApp();
 
 	// Overrides
-		// ClassWizard generated virtual function overrides
-		//{{AFX_VIRTUAL(COpenAlgoApp)
+	// ClassWizard generated virtual function overrides
+	//{{AFX_VIRTUAL(COpenAlgoApp)
 public:
 	virtual BOOL InitInstance();
 	//}}AFX_VIRTUAL
@@ -37,6 +37,9 @@ public:
 	//}}AFX_MSG
 	DECLARE_MESSAGE_MAP()
 };
+
+// Global App Object
+extern COpenAlgoApp theApp;
 
 /////////////////////////////////////////////////////////////////////////////
 

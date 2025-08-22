@@ -3,6 +3,7 @@
 #define OPENALGO_GLOBALS_H
 
 #include "stdafx.h"
+#include "resource.h"  // Include resource definitions
 
 // Status enum - MUST be defined before any usage
 enum OpenAlgoStatus
@@ -22,6 +23,7 @@ extern int g_nSymbolLimit;
 extern BOOL g_bOptimizedIntraday;
 extern int g_nTimeShift;
 extern CString g_oServer;
+extern CString g_oApiKey;  // API Key for authentication
 extern int g_nStatus;
 
 // Global function declarations

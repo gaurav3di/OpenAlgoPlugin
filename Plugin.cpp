@@ -1,9 +1,9 @@
-// Plugin.cpp - Fixed version with working status display
+// Plugin.cpp - Fixed version with working status display and funds endpoint
 #include "stdafx.h"
+#include "resource.h"  // Include resource definitions
 #include "OpenAlgoGlobals.h"
 #include "Plugin.h"
 #include "Plugin_Legacy.h"
-#include "resource.h"
 #include "OpenAlgoConfigDlg.h"
 
 // Plugin identification
@@ -44,7 +44,8 @@ BOOL g_bAutoAddSymbols = TRUE;
 int g_nSymbolLimit = 100;
 BOOL g_bOptimizedIntraday = TRUE;
 int g_nTimeShift = 0;
-CString g_oServer = "127.0.0.1";
+CString g_oServer = _T("127.0.0.1");
+CString g_oApiKey = _T("");  // API Key for authentication
 int g_nStatus = STATUS_WAIT;
 
 // Local static variables
@@ -82,6 +83,9 @@ BOOL AddToOpenAlgoPortfolio(LPCTSTR pszTicker)
 		CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, endpoint);
 
 		CInternetSession oSession(AGENT_NAME, 1, INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, INTERNET_FLAG_DONT_CACHE);
+
+		// For watchlist endpoint, we might need to add API key as header or parameter
+		// This depends on OpenAlgo's implementation
 		CStdioFile* poFile = oSession.OpenURL(oURL, 1, INTERNET_FLAG_TRANSFER_ASCII | INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE);
 
 		CString oLine;
@@ -129,6 +133,7 @@ PLUGINAPI int Init(void)
 	{
 		// Initialize on first call
 		g_oServer = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("Server"), _T("127.0.0.1"));
+		g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));  // Load API Key
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
 		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
 		g_bAutoAddSymbols = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("AutoAddSymbols"), 1);
@@ -288,33 +293,98 @@ CString GetAvailableSymbols(void)
 
 BOOL TestOpenAlgoConnection(void)
 {
+	AFX_MANAGE_STATE(AfxGetStaticModuleState());
+
+	// Check if API key is configured
+	if (g_oApiKey.IsEmpty())
+	{
+		return FALSE;
+	}
+
 	BOOL bConnected = FALSE;
 
 	try
 	{
-		CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/health"));
+		CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/funds"));
 
 		CInternetSession oSession(AGENT_NAME, 1, INTERNET_OPEN_TYPE_DIRECT, NULL, NULL,
 			INTERNET_FLAG_DONT_CACHE);
 		oSession.SetOption(INTERNET_OPTION_CONNECT_TIMEOUT, 2000);
 		oSession.SetOption(INTERNET_OPTION_RECEIVE_TIMEOUT, 2000);
 
-		CHttpFile* poFile = (CHttpFile*)oSession.OpenURL(oURL, 1,
-			INTERNET_FLAG_TRANSFER_ASCII | INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE);
+		// Prepare POST data with API key
+		CString oPostData;
+		oPostData.Format(_T("{\"apikey\":\"%s\"}"), (LPCTSTR)g_oApiKey);
 
-		if (poFile)
+		CHttpConnection* pConnection = NULL;
+		CHttpFile* pFile = NULL;
+
+		// Parse server and port
+		INTERNET_PORT nPort = (INTERNET_PORT)g_nPortNumber;
+		CString oServer = g_oServer;
+
+		// Remove http:// or https:// if present
+		oServer.Replace(_T("http://"), _T(""));
+		oServer.Replace(_T("https://"), _T(""));
+
+		pConnection = oSession.GetHttpConnection(oServer, nPort);
+
+		if (pConnection)
 		{
-			DWORD dwStatusCode = 0;
-			poFile->QueryInfoStatusCode(dwStatusCode);
+			// Create POST request
+			pFile = pConnection->OpenRequest(
+				CHttpConnection::HTTP_VERB_POST,
+				_T("/api/v1/funds"),
+				NULL,
+				1,
+				NULL,
+				NULL,
+				INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE);
 
-			if (dwStatusCode == 200)
+			if (pFile)
 			{
-				bConnected = TRUE;
+				// Set headers
+				CString oHeaders = _T("Content-Type: application/json\r\n");
+
+				// Convert string to UTF-8 for sending
+				CStringA oPostDataA(oPostData);
+
+				// Send the request
+				BOOL bResult = pFile->SendRequest(oHeaders, (LPVOID)(LPCSTR)oPostDataA, oPostDataA.GetLength());
+
+				if (bResult)
+				{
+					DWORD dwStatusCode = 0;
+					pFile->QueryInfoStatusCode(dwStatusCode);
+
+					if (dwStatusCode == 200)
+					{
+						// Read response to verify it's valid
+						CString oResponse;
+						CString oLine;
+						while (pFile->ReadString(oLine))
+						{
+							oResponse += oLine;
+							if (oResponse.GetLength() > 500) break; // Limit response size
+						}
+
+						// Check if response contains "success"
+						if (oResponse.Find(_T("\"status\":\"success\"")) >= 0 ||
+							oResponse.Find(_T("\"status\": \"success\"")) >= 0)
+						{
+							bConnected = TRUE;
+						}
+					}
+				}
+
+				pFile->Close();
+				delete pFile;
 			}
 
-			poFile->Close();
-			delete poFile;
+			pConnection->Close();
+			delete pConnection;
 		}
+
 		oSession.Close();
 	}
 	catch (CInternetException* e)
@@ -392,6 +462,7 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 
 		// Reload settings
 		g_oServer = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("Server"), _T("127.0.0.1"));
+		g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));  // Load API Key
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
 		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
 
@@ -513,7 +584,8 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 		return nLastValid + 1;
 	}
 
-	// TODO: Implement actual quote fetching
+	// TODO: Implement actual quote fetching using OpenAlgo API with authentication
+	// This will need to use the g_oApiKey for authentication
 	return nLastValid + 1;
 }
 

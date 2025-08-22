@@ -1,7 +1,8 @@
 // OpenAlgoConfigDlg.cpp : implementation file
 #include "stdafx.h"
-#include "OpenAlgoGlobals.h"  // Include this FIRST for status enum
-#include "Plugin.h"
+#include "resource.h"  // Include resource definitions
+#include "Plugin.h"  // Include Plugin.h before OpenAlgoGlobals.h
+#include "OpenAlgoGlobals.h"  // Include global variables
 #include "OpenAlgoPlugin.h"
 #include "OpenAlgoConfigDlg.h"
 
@@ -36,6 +37,9 @@ void COpenAlgoConfigDlg::DoDataExchange(CDataExchange* pDX)
 	// Map dialog controls to global variables
 	DDX_Text(pDX, IDC_SERVER_EDIT, g_oServer);
 	DDV_MaxChars(pDX, g_oServer, 255);
+
+	DDX_Text(pDX, IDC_APIKEY_EDIT, g_oApiKey);
+	DDV_MaxChars(pDX, g_oApiKey, 255);
 
 	DDX_Check(pDX, IDC_AUTOSYMBOLS_CHECK, g_bAutoAddSymbols);
 
@@ -101,8 +105,17 @@ void COpenAlgoConfigDlg::OnOK()
 		return;
 	}
 
+	// Validate API Key
+	if (g_oApiKey.IsEmpty())
+	{
+		AfxMessageBox(_T("Please enter your OpenAlgo API Key."), MB_OK | MB_ICONWARNING);
+		GetDlgItem(IDC_APIKEY_EDIT)->SetFocus();
+		return;
+	}
+
 	// Save settings to registry under "OpenAlgo" key
 	AfxGetApp()->WriteProfileString(_T("OpenAlgo"), _T("Server"), g_oServer);
+	AfxGetApp()->WriteProfileString(_T("OpenAlgo"), _T("ApiKey"), g_oApiKey);
 	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("Port"), g_nPortNumber);
 	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), g_nRefreshInterval);
 	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("AutoAddSymbols"), g_bAutoAddSymbols);
@@ -209,14 +222,22 @@ void COpenAlgoConfigDlg::OnTestConnectionButton()
 		return;
 	}
 
+	// Validate API Key
+	if (g_oApiKey.IsEmpty())
+	{
+		AfxMessageBox(_T("Please enter your OpenAlgo API Key before testing the connection."), MB_OK | MB_ICONWARNING);
+		GetDlgItem(IDC_APIKEY_EDIT)->SetFocus();
+		return;
+	}
+
 	SetDlgItemText(IDC_STATUS_STATIC, _T("Testing connection..."));
 
 	// Change cursor to wait cursor
 	CWaitCursor wait;
 
-	// Test connection to OpenAlgo server
+	// Test connection to OpenAlgo server using funds endpoint
 	BOOL bConnected = FALSE;
-	CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/health"));
+	CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/funds"));
 
 	try
 	{
@@ -225,38 +246,122 @@ void COpenAlgoConfigDlg::OnTestConnectionButton()
 		oSession.SetOption(INTERNET_OPTION_CONNECT_TIMEOUT, 5000);
 		oSession.SetOption(INTERNET_OPTION_RECEIVE_TIMEOUT, 5000);
 
-		CHttpFile* poFile = (CHttpFile*)oSession.OpenURL(oURL, 1,
-			INTERNET_FLAG_TRANSFER_ASCII | INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE);
+		// Prepare POST data with API key
+		CString oPostData;
+		oPostData.Format(_T("{\"apikey\":\"%s\"}"), (LPCTSTR)g_oApiKey);
 
-		if (poFile)
+		CHttpConnection* pConnection = NULL;
+		CHttpFile* pFile = NULL;
+
+		// Parse server and port
+		INTERNET_PORT nPort = (INTERNET_PORT)g_nPortNumber;
+		CString oServer = g_oServer;
+
+		// Remove http:// or https:// if present
+		oServer.Replace(_T("http://"), _T(""));
+		oServer.Replace(_T("https://"), _T(""));
+
+		pConnection = oSession.GetHttpConnection(oServer, nPort);
+
+		if (pConnection)
 		{
-			DWORD dwStatusCode = 0;
-			poFile->QueryInfoStatusCode(dwStatusCode);
+			// Create POST request
+			pFile = pConnection->OpenRequest(
+				CHttpConnection::HTTP_VERB_POST,
+				_T("/api/v1/funds"),
+				NULL,
+				1,
+				NULL,
+				NULL,
+				INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE);
 
-			if (dwStatusCode == 200)
+			if (pFile)
 			{
-				// Try to read response
-				CString oResponse;
-				CString oLine;
-				while (poFile->ReadString(oLine))
+				// Set headers
+				CString oHeaders = _T("Content-Type: application/json\r\n");
+
+				// Convert string to UTF-8 for sending
+				CStringA oPostDataA(oPostData);
+
+				// Send the request
+				BOOL bResult = pFile->SendRequest(oHeaders, (LPVOID)(LPCSTR)oPostDataA, oPostDataA.GetLength());
+
+				if (bResult)
 				{
-					oResponse += oLine;
-					if (oResponse.GetLength() > 1000) break; // Limit response size
+					DWORD dwStatusCode = 0;
+					pFile->QueryInfoStatusCode(dwStatusCode);
+
+					if (dwStatusCode == 200)
+					{
+						// Try to read response
+						CString oResponse;
+						CString oLine;
+						while (pFile->ReadString(oLine))
+						{
+							oResponse += oLine;
+							if (oResponse.GetLength() > 1000) break; // Limit response size
+						}
+
+						// Check if response contains "success" (simple JSON parsing)
+						if (oResponse.Find(_T("\"status\":\"success\"")) >= 0 ||
+							oResponse.Find(_T("\"status\": \"success\"")) >= 0)
+						{
+							bConnected = TRUE;
+
+							// Try to extract available cash from response
+							int iCashPos = oResponse.Find(_T("\"availablecash\":"));
+							if (iCashPos >= 0)
+							{
+								iCashPos += 17; // Move past "availablecash":"
+								int iEndPos = oResponse.Find(_T("\""), iCashPos);
+								if (iEndPos > iCashPos)
+								{
+									CString oCash = oResponse.Mid(iCashPos, iEndPos - iCashPos);
+									CString oStatus;
+									oStatus.Format(_T("Connection successful! Available Cash: %s"), (LPCTSTR)oCash);
+									SetDlgItemText(IDC_STATUS_STATIC, oStatus);
+								}
+								else
+								{
+									SetDlgItemText(IDC_STATUS_STATIC,
+										_T("Connection successful! OpenAlgo server is running."));
+								}
+							}
+							else
+							{
+								SetDlgItemText(IDC_STATUS_STATIC,
+									_T("Connection successful! OpenAlgo server is running."));
+							}
+						}
+						else if (oResponse.Find(_T("\"status\":\"error\"")) >= 0)
+						{
+							SetDlgItemText(IDC_STATUS_STATIC,
+								_T("Connection failed: Invalid API Key or server error."));
+						}
+						else
+						{
+							SetDlgItemText(IDC_STATUS_STATIC,
+								_T("Connection failed: Unexpected response from server."));
+						}
+					}
+					else
+					{
+						CString oStatus;
+						oStatus.Format(_T("Server returned HTTP status code: %lu"), dwStatusCode);
+						SetDlgItemText(IDC_STATUS_STATIC, oStatus);
+					}
+				}
+				else
+				{
+					SetDlgItemText(IDC_STATUS_STATIC, _T("Failed to send request to server."));
 				}
 
-				bConnected = TRUE;
-				SetDlgItemText(IDC_STATUS_STATIC,
-					_T("Connection successful! OpenAlgo server is running."));
-			}
-			else
-			{
-				CString oStatus;
-				oStatus.Format(_T("Server returned HTTP status code: %lu"), dwStatusCode);
-				SetDlgItemText(IDC_STATUS_STATIC, oStatus);
+				pFile->Close();
+				delete pFile;
 			}
 
-			poFile->Close();
-			delete poFile;
+			pConnection->Close();
+			delete pConnection;
 		}
 		else
 		{
