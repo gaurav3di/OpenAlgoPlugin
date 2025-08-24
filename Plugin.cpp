@@ -914,7 +914,7 @@ BOOL TestOpenAlgoConnection(void)
 
 	try
 	{
-		CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/funds"));
+		CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/ping"));
 
 		CInternetSession oSession(AGENT_NAME, 1, INTERNET_OPEN_TYPE_DIRECT, NULL, NULL,
 			INTERNET_FLAG_DONT_CACHE);
@@ -943,7 +943,7 @@ BOOL TestOpenAlgoConnection(void)
 			// Create POST request
 			pFile = pConnection->OpenRequest(
 				CHttpConnection::HTTP_VERB_POST,
-				_T("/api/v1/funds"),
+				_T("/api/v1/ping"),
 				NULL,
 				1,
 				NULL,
@@ -977,9 +977,11 @@ BOOL TestOpenAlgoConnection(void)
 							if (oResponse.GetLength() > 500) break; // Limit response size
 						}
 
-						// Check if response contains "success"
-						if (oResponse.Find(_T("\"status\":\"success\"")) >= 0 ||
-							oResponse.Find(_T("\"status\": \"success\"")) >= 0)
+						// Check if response contains "success" and "pong"
+						if ((oResponse.Find(_T("\"status\":\"success\"")) >= 0 ||
+							 oResponse.Find(_T("\"status\": \"success\"")) >= 0) &&
+							(oResponse.Find(_T("\"message\":\"pong\"")) >= 0 ||
+							 oResponse.Find(_T("\"message\": \"pong\"")) >= 0))
 						{
 							bConnected = TRUE;
 						}

@@ -235,9 +235,9 @@ void COpenAlgoConfigDlg::OnTestConnectionButton()
 	// Change cursor to wait cursor
 	CWaitCursor wait;
 
-	// Test connection to OpenAlgo server using funds endpoint
+	// Test connection to OpenAlgo server using ping endpoint
 	BOOL bConnected = FALSE;
-	CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/funds"));
+	CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/ping"));
 
 	try
 	{
@@ -268,7 +268,7 @@ void COpenAlgoConfigDlg::OnTestConnectionButton()
 			// Create POST request
 			pFile = pConnection->OpenRequest(
 				CHttpConnection::HTTP_VERB_POST,
-				_T("/api/v1/funds"),
+				_T("/api/v1/ping"),
 				NULL,
 				1,
 				NULL,
@@ -302,23 +302,25 @@ void COpenAlgoConfigDlg::OnTestConnectionButton()
 							if (oResponse.GetLength() > 1000) break; // Limit response size
 						}
 
-						// Check if response contains "success" (simple JSON parsing)
-						if (oResponse.Find(_T("\"status\":\"success\"")) >= 0 ||
-							oResponse.Find(_T("\"status\": \"success\"")) >= 0)
+						// Check if response contains "success" and "pong" (simple JSON parsing)
+						if ((oResponse.Find(_T("\"status\":\"success\"")) >= 0 ||
+							 oResponse.Find(_T("\"status\": \"success\"")) >= 0) &&
+							(oResponse.Find(_T("\"message\":\"pong\"")) >= 0 ||
+							 oResponse.Find(_T("\"message\": \"pong\"")) >= 0))
 						{
 							bConnected = TRUE;
 
-							// Try to extract available cash from response
-							int iCashPos = oResponse.Find(_T("\"availablecash\":"));
-							if (iCashPos >= 0)
+							// Try to extract broker from response
+							int iBrokerPos = oResponse.Find(_T("\"broker\":"));
+							if (iBrokerPos >= 0)
 							{
-								iCashPos += 17; // Move past "availablecash":"
-								int iEndPos = oResponse.Find(_T("\""), iCashPos);
-								if (iEndPos > iCashPos)
+								iBrokerPos += 10; // Move past "broker":"
+								int iEndPos = oResponse.Find(_T("\""), iBrokerPos);
+								if (iEndPos > iBrokerPos)
 								{
-									CString oCash = oResponse.Mid(iCashPos, iEndPos - iCashPos);
+									CString oBroker = oResponse.Mid(iBrokerPos, iEndPos - iBrokerPos);
 									CString oStatus;
-									oStatus.Format(_T("Connection successful! Available Cash: %s"), (LPCTSTR)oCash);
+									oStatus.Format(_T("Connection successful! Broker: %s"), (LPCTSTR)oBroker);
 									SetDlgItemText(IDC_STATUS_STATIC, oStatus);
 								}
 								else
