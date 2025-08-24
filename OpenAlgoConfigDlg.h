@@ -9,6 +9,10 @@
 #endif // _MSC_VER > 1000
 
 #include "resource.h"  // Include resource IDs
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#pragma comment(lib, "ws2_32.lib")
 
 // Forward declaration
 struct InfoSite;
@@ -43,15 +47,21 @@ protected:
 	//{{AFX_MSG(COpenAlgoConfigDlg)
 	virtual BOOL OnInitDialog();
 	virtual void OnOK();
-	afx_msg void OnRetrieveButton();
 	afx_msg void OnTestConnectionButton();
-	afx_msg void OnAutoSymbolsCheck();
+	afx_msg void OnTestWebSocketButton();
 	//}}AFX_MSG
 	DECLARE_MESSAGE_MAP()
 
 private:
 	// Helper functions
-	void UpdateControlStates();
+	BOOL TestWebSocketConnection(const CString& wsUrl, const CString& apiKey);
+	BOOL SendWebSocketFrame(SOCKET sock, const CString& message);
+	CString DecodeWebSocketFrame(const char* buffer, int length);
+	void GenerateMaskKey(unsigned char* maskKey);
+	
+	// WebSocket related members
+	CString m_wsUrl;
+	BOOL m_bWebSocketConnected;
 };
 
 //{{AFX_INSERT_LOCATION}}

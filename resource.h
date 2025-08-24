@@ -21,6 +21,10 @@
 #define IDC_STATIC_TIMESHIFT            1015
 #define IDC_APIKEY_EDIT                 1016
 #define IDC_STATIC_APIKEY               1017
+#define IDC_WEBSOCKET_EDIT              1018
+#define IDC_STATIC_WEBSOCKET            1019
+#define IDC_TEST_WEBSOCKET_BUTTON       1020
+#define IDC_WEBSOCKET_STATUS_STATIC     1021
 #define ID_STATUS_RECONNECT             32771
 #define ID_STATUS_SHUTDOWN              32772
 #define ID_STATUS_ADDSYMBOL             32773
@@ -33,7 +37,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        1001
 #define _APS_NEXT_COMMAND_VALUE         32776
-#define _APS_NEXT_CONTROL_VALUE         1018
+#define _APS_NEXT_CONTROL_VALUE         1022
 #define _APS_NEXT_SYMED_VALUE           1000
 #endif
 #endif

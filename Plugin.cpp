@@ -42,12 +42,10 @@ static struct PluginInfo oPluginInfo =
 HWND g_hAmiBrokerWnd = NULL;
 int g_nPortNumber = 5000;
 int g_nRefreshInterval = 5;
-BOOL g_bAutoAddSymbols = TRUE;
-int g_nSymbolLimit = 100;
-BOOL g_bOptimizedIntraday = TRUE;
 int g_nTimeShift = 0;
 CString g_oServer = _T("127.0.0.1");
 CString g_oApiKey = _T("");  // API Key for authentication
+CString g_oWebSocketUrl = _T("ws://127.0.0.1:8765");  // WebSocket URL
 int g_nStatus = STATUS_WAIT;
 
 // Local static variables
@@ -736,11 +734,9 @@ PLUGINAPI int Init(void)
 		// Initialize on first call
 		g_oServer = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("Server"), _T("127.0.0.1"));
 		g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));  // Load API Key
+		g_oWebSocketUrl = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("WebSocketUrl"), _T("ws://127.0.0.1:8765"));  // Load WebSocket URL
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
 		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
-		g_bAutoAddSymbols = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("AutoAddSymbols"), 1);
-		g_nSymbolLimit = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("SymbolLimit"), 100);
-		g_bOptimizedIntraday = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("OptimizedIntraday"), 1);
 		g_nTimeShift = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("TimeShift"), 0);
 
 		g_nStatus = STATUS_WAIT;
@@ -797,7 +793,7 @@ PLUGINAPI int SetTimeBase(int nTimeBase)
 
 PLUGINAPI int GetSymbolLimit(void)
 {
-	return g_nSymbolLimit;
+	return 1000; // Default symbol limit since we removed the configurable option
 }
 
 // CRITICAL FUNCTION - This makes the status LED work!
@@ -1074,6 +1070,7 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 		// Reload settings
 		g_oServer = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("Server"), _T("127.0.0.1"));
 		g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));  // Load API Key
+		g_oWebSocketUrl = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("WebSocketUrl"), _T("ws://127.0.0.1:8765"));  // Load WebSocket URL
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
 		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
 

@@ -18,12 +18,10 @@ enum OpenAlgoStatus
 extern HWND g_hAmiBrokerWnd;
 extern int g_nPortNumber;
 extern int g_nRefreshInterval;
-extern BOOL g_bAutoAddSymbols;
-extern int g_nSymbolLimit;
-extern BOOL g_bOptimizedIntraday;
 extern int g_nTimeShift;
 extern CString g_oServer;
 extern CString g_oApiKey;  // API Key for authentication
+extern CString g_oWebSocketUrl;  // WebSocket URL for real-time data
 extern int g_nStatus;
 
 // Global function declarations
