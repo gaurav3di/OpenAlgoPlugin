@@ -10,6 +10,11 @@
 #pragma once
 #endif // _MSC_VER > 1000
 
+// Define Windows target version (Windows 7 and later)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #define VC_EXTRALEAN		// Exclude rarely-used stuff from Windows headers
 
 // Disable specific warnings for compilation
