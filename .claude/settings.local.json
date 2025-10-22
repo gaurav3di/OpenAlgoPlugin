@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(mkdir:*)"
+      "Bash",
+      "FileRead",
+      "FileWrite",
+      "Grep",
+      "Update",
+      "Write",
+      "Read(//c/Users/Admin1/Desktop/**)"
     ],
     "deny": [],
     "ask": []

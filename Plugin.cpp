@@ -110,9 +110,57 @@ BOOL ProcessWebSocketData(void);
 void GenerateWebSocketMaskKey(unsigned char* maskKey);
 void SubscribePendingSymbols(void);
 
+// Helper function for mixed EOD/Intraday data
+int FindLastBarOfMatchingType(int nPeriodicity, int nLastValid, struct Quotation* pQuotes);
+
 ///////////////////////////////
 // Helper Functions
 ///////////////////////////////
+// Find last bar in array that matches the requested periodicity type
+// This is CRITICAL for Mixed EOD/Intraday support (AllowMixedEODIntra = TRUE)
+//
+// When mixed data is enabled, pQuotes array contains BOTH:
+// - Daily bars (Hour=31, Minute=63)
+// - Intraday bars (Hour=0-23)
+//
+// We must find the last bar of the CORRECT type to calculate gaps properly
+int FindLastBarOfMatchingType(int nPeriodicity, int nLastValid, struct Quotation* pQuotes)
+{
+	if (nLastValid < 0 || pQuotes == NULL)
+		return -1;  // No data at all
+
+	if (nPeriodicity == 86400)  // Looking for Daily data
+	{
+		// Scan backwards to find last Daily bar (Hour=31, Minute=63)
+		for (int i = nLastValid; i >= 0; i--)
+		{
+			if (pQuotes[i].DateTime.PackDate.Hour == DATE_EOD_HOURS &&
+				pQuotes[i].DateTime.PackDate.Minute == DATE_EOD_MINUTES)
+			{
+				return i;  // Found last Daily bar
+			}
+		}
+		return -1;  // No Daily bars found in array
+	}
+	else if (nPeriodicity == 60)  // Looking for 1-minute (or other intraday) data
+	{
+		// Scan backwards to find last Intraday bar (Hour < 31)
+		for (int i = nLastValid; i >= 0; i--)
+		{
+			if (pQuotes[i].DateTime.PackDate.Hour < DATE_EOD_HOURS)
+			{
+				return i;  // Found last Intraday bar
+			}
+		}
+		return -1;  // No Intraday bars found in array
+	}
+	else
+	{
+		// Unknown periodicity - use last bar overall
+		return nLastValid;
+	}
+}
+
 CString BuildOpenAlgoURL(const CString& server, int port, const CString& endpoint)
 {
 	CString result;
@@ -357,15 +405,24 @@ BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote)
 // Fetch historical data from OpenAlgo with intelligent backfill strategy
 // COMPLETELY EXCHANGE-AGNOSTIC - Works with ANY exchange and ANY trading hours
 //
-// BACKFILL STRATEGY:
-// - First load: Gets last 30 days of 1m data or 1 year of daily data
-// - Subsequent refreshes: Gets TODAY'S data only (start_date = end_date = today)
-// - Smart duplicate handling: Updates existing bars, adds only new bars
-// - Maintains data integrity and chart consistency
+// OPTIMAL GAP-FREE BACKFILL STRATEGY (DATE-BASED):
+// - First load: 30 days (1m) or 10 years (daily) of historical data
+// - Subsequent refreshes: Smart gap detection from last bar's date
+// - Automatically fills data gaps (user absences, network outages, etc.)
+// - Safety limits: Max 30 days for 1m, max 730 days (2 years) for daily
+// - Zero data holes within safety limits
+//
+// HOW IT WORKS:
+// 1. Extract last bar's DATE (not time) from existing data
+// 2. Calculate gap in days between last bar and today
+// 3. Apply safety limits to prevent server overload
+// 4. Request date range from OpenAlgo API (DATE-only, no time)
+// 5. API returns ALL bars for each date in range
+// 6. Duplicate detection handles overlapping bars
 //
 // EXCHANGE SUPPORT:
 // - NSE: Regular + evening sessions + special Sunday sessions
-// - MCX: Overnight sessions + extended hours  
+// - MCX: Overnight sessions + extended hours
 // - Crypto: 24x7 including weekends
 // - Any future sessions that exchanges may introduce
 //
@@ -386,38 +443,145 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 		CString exchange = GetExchangeFromTicker(pszTicker);
 		CString interval = GetIntervalString(nPeriodicity);
 
-		// Calculate date range based on existing data
-		CTime endTime = CTime::GetCurrentTime();
-		CTime startTime = endTime;
+		// Get current time and today's date (at midnight)
+		CTime currentTime = CTime::GetCurrentTime();
+		CTime todayDate = CTime(currentTime.GetYear(), currentTime.GetMonth(), currentTime.GetDay(), 0, 0, 0);
 
-		// Determine start date based on existing data
+		CTime startTime;
+		CTime endTime = todayDate;  // Request up to today for both Daily and Intraday
+
+		// SMART GAP-FREE BACKFILL LOGIC WITH MIXED EOD/INTRADAY SUPPORT
 		if (nLastValid >= 0 && pQuotes != NULL)
 		{
-			// We have existing data - for refresh, only get TODAY'S data
-			// This ensures we get the latest bars for the current trading day
-			startTime = CTime(endTime.GetYear(), endTime.GetMonth(), endTime.GetDay(), 0, 0, 0);
-			
-			// For daily data, we might want a bit more range
-			if (nPeriodicity == 86400) // Daily data
+			// ============================================================
+			// EXISTING DATA FOUND - Smart Gap Detection
+			// ============================================================
+
+			// CRITICAL: Find last bar of MATCHING TYPE for mixed data support
+			// When AllowMixedEODIntra = TRUE, array contains both Daily and Intraday bars
+			// We must find the last bar that matches our requested periodicity!
+			int lastMatchingBarIndex = FindLastBarOfMatchingType(nPeriodicity, nLastValid, pQuotes);
+
+			if (lastMatchingBarIndex < 0)
 			{
-				// For daily data refresh, get last few days to ensure we have recent bars
-				startTime -= CTimeSpan(7, 0, 0, 0);
+				// No bars of matching type found → Treat as initial load
+				// Example: Requesting Daily data but only 1-minute bars exist
+				if (nPeriodicity == 60)
+					startTime = todayDate - CTimeSpan(30, 0, 0, 0);
+				else
+					startTime = todayDate - CTimeSpan(3650, 0, 0, 0);
+
+				goto skip_gap_detection;
+			}
+
+			// Extract last matching bar's DATE (ignore time component)
+			int lastBarYear = pQuotes[lastMatchingBarIndex].DateTime.PackDate.Year;
+			int lastBarMonth = pQuotes[lastMatchingBarIndex].DateTime.PackDate.Month;
+			int lastBarDay = pQuotes[lastMatchingBarIndex].DateTime.PackDate.Day;
+
+			// Create CTime for last bar's date (at midnight)
+			CTime lastBarDate;
+			try
+			{
+				lastBarDate = CTime(lastBarYear, lastBarMonth, lastBarDay, 0, 0, 0);
+			}
+			catch (...)
+			{
+				// Invalid date in last bar (corrupted data)
+				// Fall back to initial load
+				if (nPeriodicity == 60)
+					startTime = todayDate - CTimeSpan(30, 0, 0, 0);
+				else
+					startTime = todayDate - CTimeSpan(3650, 0, 0, 0);
+
+				goto skip_gap_detection;
+			}
+
+			// VALIDATE: Check if last bar is in the future (corrupted data)
+			if (lastBarDate > todayDate)
+			{
+				// Last bar is in future - corrupted data detected
+				// Fall back to initial load
+				if (nPeriodicity == 60)
+					startTime = todayDate - CTimeSpan(30, 0, 0, 0);
+				else
+					startTime = todayDate - CTimeSpan(3650, 0, 0, 0);
+
+				goto skip_gap_detection;
+			}
+
+			// Calculate gap in days
+			CTimeSpan gap = todayDate - lastBarDate;
+			int gapDays = (int)gap.GetDays();
+
+			// Apply different logic for Daily vs Intraday data
+			if (nPeriodicity == 60)  // 1-minute data
+			{
+				const int MAX_BACKFILL_DAYS_1M = 30;  // Safety limit for 1-minute data
+
+				// Check if data is too old → Force initial load
+				if (gapDays > MAX_BACKFILL_DAYS_1M)
+				{
+					// Data too stale - do fresh 30-day load
+					startTime = todayDate - CTimeSpan(MAX_BACKFILL_DAYS_1M, 0, 0, 0);
+				}
+				else
+				{
+					// Recent data - backfill from last bar's date
+					startTime = lastBarDate;
+				}
+			}
+			else  // Daily data (nPeriodicity == 86400)
+			{
+				const int MAX_BACKFILL_DAYS_DAILY = 730;     // Safety limit: 2 years
+				const int MIN_DAILY_BARS = 250;               // ~1 year of trading days
+				const int STALENESS_THRESHOLD_DAYS = 365;    // 1 year staleness check
+
+				// CHECK 1: Do we have enough bars for proper analysis?
+				if (lastMatchingBarIndex < MIN_DAILY_BARS)
+				{
+					// Too few Daily bars - do initial 10-year load
+					startTime = todayDate - CTimeSpan(3650, 0, 0, 0);
+				}
+				// CHECK 2: Is data too stale?
+				else if (gapDays > STALENESS_THRESHOLD_DAYS)
+				{
+					// Gap > 1 year - do initial 10-year load
+					startTime = todayDate - CTimeSpan(3650, 0, 0, 0);
+				}
+				// CHECK 3: Gap within safety limit?
+				else if (gapDays > MAX_BACKFILL_DAYS_DAILY)
+				{
+					// Gap exceeds 2-year safety limit - cap at maximum
+					startTime = todayDate - CTimeSpan(MAX_BACKFILL_DAYS_DAILY, 0, 0, 0);
+				}
+				else
+				{
+					// Good recent data - backfill from last bar's date
+					startTime = lastBarDate;
+				}
 			}
 		}
 		else
 		{
-			// No existing data - initial backfill
-			if (nPeriodicity == 60) // 1-minute data
+			// ============================================================
+			// NO EXISTING DATA - Initial Backfill
+			// ============================================================
+
+			if (nPeriodicity == 60)  // 1-minute data
 			{
-				// For 1-minute data, get last 30 days for initial load
-				startTime -= CTimeSpan(30, 0, 0, 0);
+				// Initial load: 30 days of 1-minute data
+				startTime = todayDate - CTimeSpan(30, 0, 0, 0);
 			}
-			else // Daily data
+			else  // Daily data
 			{
-				// For daily data, get 1 year for initial load
-				startTime -= CTimeSpan(365, 0, 0, 0);
+				// Initial load: 10 years of daily data (increased from 1 year)
+				// This provides sufficient historical context for technical analysis
+				startTime = todayDate - CTimeSpan(3650, 0, 0, 0);
 			}
 		}
+
+skip_gap_detection:
 
 		CString startDate = startTime.Format(_T("%Y-%m-%d"));
 		CString endDate = endTime.Format(_T("%Y-%m-%d"));
@@ -526,8 +690,15 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 										// For daily data, set the DAILY_MASK and EOD markers
 										ConvertUnixToPackedDate(timestamp, &pQuotes[quoteIndex].DateTime);
 										pQuotes[quoteIndex].DateTime.Date |= DAILY_MASK;
-										pQuotes[quoteIndex].DateTime.PackDate.Hour = 31; // EOD marker
-										pQuotes[quoteIndex].DateTime.PackDate.Minute = 63; // EOD marker
+
+										// Set EOD markers and normalize ALL time fields
+										// CRITICAL: All Daily bars must have identical time fields
+										// to avoid display issues with the last candle
+										pQuotes[quoteIndex].DateTime.PackDate.Hour = 31;      // EOD marker
+										pQuotes[quoteIndex].DateTime.PackDate.Minute = 63;    // EOD marker
+										pQuotes[quoteIndex].DateTime.PackDate.Second = 0;     // Normalize
+										pQuotes[quoteIndex].DateTime.PackDate.MilliSec = 0;   // Normalize
+										pQuotes[quoteIndex].DateTime.PackDate.MicroSec = 0;   // Normalize
 									}
 									else
 									{
@@ -598,33 +769,48 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 										pQuotes[quoteIndex].AuxData2 = 0;
 
 										// Check for duplicate timestamps against existing data
+										// FIXED: Properly handle mixed EOD/Intraday data without mktime() corruption
 										BOOL bIsDuplicate = FALSE;
 										if (bHasExistingData)
 										{
-											// Convert new bar timestamp for comparison
-											struct tm newBarTime;
-											newBarTime.tm_year = pQuotes[quoteIndex].DateTime.PackDate.Year - 1900;
-											newBarTime.tm_mon = pQuotes[quoteIndex].DateTime.PackDate.Month - 1;
-											newBarTime.tm_mday = pQuotes[quoteIndex].DateTime.PackDate.Day;
-											newBarTime.tm_hour = pQuotes[quoteIndex].DateTime.PackDate.Hour;
-											newBarTime.tm_min = pQuotes[quoteIndex].DateTime.PackDate.Minute;
-											newBarTime.tm_sec = pQuotes[quoteIndex].DateTime.PackDate.Second;
-											time_t newTimestamp = mktime(&newBarTime);
-											
+											// Get new bar's properties
+											BOOL bNewBarIsEOD = (pQuotes[quoteIndex].DateTime.PackDate.Hour == DATE_EOD_HOURS &&
+											                     pQuotes[quoteIndex].DateTime.PackDate.Minute == DATE_EOD_MINUTES);
+
 											// Check against existing bars (check reasonable range)
 											for (int i = max(0, nLastValid - 100); i <= nLastValid; i++)
 											{
-												struct tm existingTime;
-												existingTime.tm_year = pQuotes[i].DateTime.PackDate.Year - 1900;
-												existingTime.tm_mon = pQuotes[i].DateTime.PackDate.Month - 1;
-												existingTime.tm_mday = pQuotes[i].DateTime.PackDate.Day;
-												existingTime.tm_hour = pQuotes[i].DateTime.PackDate.Hour;
-												existingTime.tm_min = pQuotes[i].DateTime.PackDate.Minute;
-												existingTime.tm_sec = pQuotes[i].DateTime.PackDate.Second;
-												time_t existingTimestamp = mktime(&existingTime);
-												
-												// If timestamps are within 1 minute, consider it duplicate
-												if (abs((int)(newTimestamp - existingTimestamp)) < 60)
+												// SOLUTION 2: Filter by periodicity - Never compare across interval types
+												BOOL bExistingBarIsEOD = (pQuotes[i].DateTime.PackDate.Hour == DATE_EOD_HOURS &&
+												                          pQuotes[i].DateTime.PackDate.Minute == DATE_EOD_MINUTES);
+
+												// Skip if different interval types (EOD vs Intraday)
+												if (bNewBarIsEOD != bExistingBarIsEOD)
+													continue;
+
+												// SOLUTION 3: Direct PackDate comparison instead of mktime()
+												BOOL bSameBar = FALSE;
+
+												if (bNewBarIsEOD)
+												{
+													// For EOD bars: Compare DATE ONLY (Year, Month, Day)
+													// Ignore time components since Hour=31, Minute=63 are markers, not actual time
+													bSameBar = (pQuotes[quoteIndex].DateTime.PackDate.Year == pQuotes[i].DateTime.PackDate.Year &&
+													           pQuotes[quoteIndex].DateTime.PackDate.Month == pQuotes[i].DateTime.PackDate.Month &&
+													           pQuotes[quoteIndex].DateTime.PackDate.Day == pQuotes[i].DateTime.PackDate.Day);
+												}
+												else
+												{
+													// For Intraday bars: Compare full timestamp (Year, Month, Day, Hour, Minute)
+													// Allow same minute to be considered duplicate
+													bSameBar = (pQuotes[quoteIndex].DateTime.PackDate.Year == pQuotes[i].DateTime.PackDate.Year &&
+													           pQuotes[quoteIndex].DateTime.PackDate.Month == pQuotes[i].DateTime.PackDate.Month &&
+													           pQuotes[quoteIndex].DateTime.PackDate.Day == pQuotes[i].DateTime.PackDate.Day &&
+													           pQuotes[quoteIndex].DateTime.PackDate.Hour == pQuotes[i].DateTime.PackDate.Hour &&
+													           pQuotes[quoteIndex].DateTime.PackDate.Minute == pQuotes[i].DateTime.PackDate.Minute);
+												}
+
+												if (bSameBar)
 												{
 													bIsDuplicate = TRUE;
 													// Update existing bar with latest data instead of adding new
@@ -637,7 +823,7 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 												}
 											}
 										}
-										
+
 										// Only add new bar if it's not a duplicate
 										if (!bIsDuplicate)
 										{
@@ -1245,10 +1431,42 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 	// Handle intraday data (1-minute only for now)
 	else if (nPeriodicity == 60)
 	{
-		// Always fetch fresh historical data from OpenAlgo
-		// This ensures charts stay accurate and up-to-date with proper OHLC bars
-		// Quote data should never be mixed with interval data
-		int nQty = GetOpenAlgoHistory(pszTicker, nPeriodicity, nLastValid, nSize, pQuotes);
+		// MIXED EOD/INTRADAY SUPPORT:
+		// When base interval is 1-minute, AmiBroker only calls GetQuotesEx(ticker, 60).
+		// It compresses 1m data to create 5m, 15m, Daily charts automatically.
+		// But in Mixed EOD mode (AllowMixedEODIntra = TRUE), we need BOTH:
+		//   - Daily EOD data (10 years) - OLDEST, stored first
+		//   - Intraday data (1m, 30 days) - NEWEST, stored after Daily
+		//
+		// CRITICAL: Fetch in chronological order!
+		// AmiBroker requires array sorted oldest→newest:
+		//   [0...2473]    : Daily bars (2015-2025)
+		//   [2474...10033]: 1-minute bars (last 30 days)
+
+		int nQty = nLastValid + 1;
+
+		// Step 1: Check if Daily EOD data exists
+		// Use FindLastBarOfMatchingType to scan for bars with Hour=31, Minute=63
+		int lastDailyBarIndex = FindLastBarOfMatchingType(86400, nLastValid, pQuotes);
+
+		if (lastDailyBarIndex < 0)
+		{
+			// No Daily data found - Fetch Daily data FIRST (chronologically oldest)
+			// This puts 10 years of Daily bars at the beginning of the array
+			nQty = GetOpenAlgoHistory(pszTicker, 86400, nLastValid, nSize, pQuotes);
+		}
+		else if (lastDailyBarIndex < 250)
+		{
+			// Found some Daily data but < 250 bars (~1 year)
+			// Insufficient for technical analysis - fetch full 10 years FIRST
+			nQty = GetOpenAlgoHistory(pszTicker, 86400, nLastValid, nSize, pQuotes);
+		}
+		// else: Daily data exists and is sufficient (>= 250 bars)
+
+		// Step 2: Fetch 1-minute intraday data (chronologically newest)
+		// This appends after Daily data, maintaining chronological order
+		nQty = GetOpenAlgoHistory(pszTicker, 60, nQty - 1, nSize, pQuotes);
+
 		return nQty;
 	}
 	else
