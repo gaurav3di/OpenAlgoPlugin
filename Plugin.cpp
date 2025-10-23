@@ -7,6 +7,7 @@
 #include "OpenAlgoConfigDlg.h"
 #include <math.h>
 #include <time.h>
+#include <stdlib.h>  // For qsort
 
 // Plugin identification
 #define PLUGIN_NAME "OpenAlgo Data Plugin"
@@ -113,9 +114,31 @@ void SubscribePendingSymbols(void);
 // Helper function for mixed EOD/Intraday data
 int FindLastBarOfMatchingType(int nPeriodicity, int nLastValid, struct Quotation* pQuotes);
 
+// Helper function to compare two quotations for sorting by timestamp
+int CompareQuotations(const void* a, const void* b);
+
 ///////////////////////////////
 // Helper Functions
 ///////////////////////////////
+
+// Compare two quotations for sorting by timestamp (oldest to newest)
+// Used by qsort() to ensure quotes array is in chronological order
+// This is CRITICAL for AmiBroker to display charts correctly
+int CompareQuotations(const void* a, const void* b)
+{
+	const struct Quotation* qa = (const struct Quotation*)a;
+	const struct Quotation* qb = (const struct Quotation*)b;
+
+	// Compare 64-bit DateTime.Date field directly
+	// This handles both EOD and Intraday data correctly
+	if (qa->DateTime.Date < qb->DateTime.Date)
+		return -1;
+	else if (qa->DateTime.Date > qb->DateTime.Date)
+		return 1;
+	else
+		return 0;
+}
+
 // Find last bar in array that matches the requested periodicity type
 // This is CRITICAL for Mixed EOD/Intraday support (AllowMixedEODIntra = TRUE)
 //
@@ -704,6 +727,17 @@ skip_gap_detection:
 									{
 										// For intraday data
 										ConvertUnixToPackedDate(timestamp, &pQuotes[quoteIndex].DateTime);
+
+										// CRITICAL FIX: Normalize sub-minute time fields for 1-minute bars
+										// This prevents freak candles during live updates when seconds change
+										// Same principle as Daily bars - all bars for the same minute must have
+										// identical time fields to avoid duplicate bar creation
+										if (nPeriodicity == 60) // 1-minute data
+										{
+											pQuotes[quoteIndex].DateTime.PackDate.Second = 0;     // Normalize
+											pQuotes[quoteIndex].DateTime.PackDate.MilliSec = 0;   // Normalize
+											pQuotes[quoteIndex].DateTime.PackDate.MicroSec = 0;   // Normalize
+										}
 									}
 
 										// Parse OHLCV
@@ -843,6 +877,14 @@ skip_gap_detection:
 								pConnection->Close();
 								delete pConnection;
 								oSession.Close();
+
+								// CRITICAL: Sort quotes by timestamp (oldest to newest)
+								// This ensures proper chronological order after merging new data with existing data
+								// Without sorting, timestamps can be mixed up when filling gaps or adding historical data
+								if (quoteIndex > 0)
+								{
+									qsort(pQuotes, quoteIndex, sizeof(struct Quotation), CompareQuotations);
+								}
 
 								// If we have more data than the array can hold, keep the most recent data
 								if (quoteIndex > nSize)
