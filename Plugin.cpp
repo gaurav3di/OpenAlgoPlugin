@@ -13,7 +13,7 @@
 #define PLUGIN_NAME "OpenAlgo Data Plugin"
 #define VENDOR_NAME "OpenAlgo Community"
 #define PLUGIN_VERSION 10003
-#define PLUGIN_ID PIDCODE('O', 'A', 'L', 'G')
+#define PLUGIN_ID PIDCODE('T', 'E', 'S', 'T')  // Unique 4-char code
 #define THIS_PLUGIN_TYPE PLUGIN_TYPE_DATA
 #define AGENT_NAME PLUGIN_NAME
 
