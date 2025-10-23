@@ -303,25 +303,24 @@ void COpenAlgoConfigDlg::OnTestWebSocketButton()
 	// Validate API Key
 	if (g_oApiKey.IsEmpty())
 	{
-		SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("API Key is required for WebSocket connection"));
+		SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("API Key is required"));
 		return;
 	}
 
 	// Change cursor to wait cursor
 	CWaitCursor wait;
-	
-	SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("Testing WebSocket connection..."));
+
+	SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("Testing..."));
 
 	// Test WebSocket connection
 	if (TestWebSocketConnection(g_oWebSocketUrl, g_oApiKey))
 	{
-		// Success message will be set by the TestWebSocketConnection function
-		// when it receives and displays the quote data
+		// Success message is set by TestWebSocketConnection function
 	}
 	else
 	{
-		SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, 
-			_T("WebSocket test failed. Check URL, API Key and ensure server is running."));
+		SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+			_T("WebSocket connection failed"));
 	}
 }
 
@@ -453,12 +452,9 @@ BOOL COpenAlgoConfigDlg::TestWebSocketConnection(const CString& wsUrl, const CSt
 			// Check for successful upgrade
 			if (response.Find(_T("101")) > 0 && response.Find(_T("Switching Protocols")) > 0)
 			{
-				// WebSocket connection established successfully
-				SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("WebSocket connected. Authenticating..."));
-				
 				// Now send authentication message
 				CString authMsg = _T("{\"action\":\"authenticate\",\"api_key\":\"") + apiKey + _T("\"}");
-				
+
 				if (SendWebSocketFrame(sock, authMsg))
 				{
 					// Wait for authentication response
@@ -469,87 +465,80 @@ BOOL COpenAlgoConfigDlg::TestWebSocketConnection(const CString& wsUrl, const CSt
 						CString authResponse = DecodeWebSocketFrame(authBuffer, authReceived);
 						
 						// Check for success status in authentication response
-						if (authResponse.Find(_T("success")) >= 0)
+						if (authResponse.Find(_T("success")) >= 0 ||
+							authResponse.Find(_T("authenticated")) >= 0 ||
+							authResponse.Find(_T("\"status\":\"ok\"")) >= 0)
 						{
-							SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("Authenticated. Subscribing to RELIANCE-NSE quotes..."));
-							
 							// Authentication successful, now test subscribe to RELIANCE-NSE
 							CString subMsg = _T("{\"action\":\"subscribe\",\"symbol\":\"RELIANCE\",\"exchange\":\"NSE\",\"mode\":2}");
-							
+
 							if (SendWebSocketFrame(sock, subMsg))
 							{
-								// Wait for subscription confirmation and quote data
-								Sleep(1000); // Wait 1 second for data
-								
-								// Try to receive quote data multiple times
-								CString receivedData;
-								BOOL dataReceived = FALSE;
-								
-								for (int attempts = 0; attempts < 3; attempts++)
+								// Wait for subscription response
+								Sleep(1000);
+
+								// Try to receive any response (subscription confirmation or data)
+								char quoteBuffer[2048];
+								int quoteReceived = recv(sock, quoteBuffer, sizeof(quoteBuffer) - 1, 0);
+
+								BOOL subscriptionWorked = FALSE;
+								if (quoteReceived > 0)
 								{
-									char quoteBuffer[2048];
-									int quoteReceived = recv(sock, quoteBuffer, sizeof(quoteBuffer) - 1, 0);
-									if (quoteReceived > 0)
+									CString response = DecodeWebSocketFrame(quoteBuffer, quoteReceived);
+
+									// Check if we got any valid response (subscription confirmation or market data)
+									if (!response.IsEmpty())
 									{
-										CString quoteData = DecodeWebSocketFrame(quoteBuffer, quoteReceived);
-										
-										// Check if this is market data
-										if (!quoteData.IsEmpty() && quoteData.Find(_T("market_data")) >= 0)
-										{
-											receivedData = quoteData;
-											dataReceived = TRUE;
-											break;
-										}
+										subscriptionWorked = TRUE;
 									}
-									Sleep(500); // Wait 500ms between attempts
 								}
-								
-								// Display the received quote data in the status
-								if (dataReceived && !receivedData.IsEmpty())
+
+								// Unsubscribe
+								CString unsubMsg = _T("{\"action\":\"unsubscribe\",\"symbol\":\"RELIANCE\",\"exchange\":\"NSE\",\"mode\":2}");
+								SendWebSocketFrame(sock, unsubMsg);
+
+								// Show simple success message
+								if (subscriptionWorked)
 								{
-									// Show received data in status (truncated for display)
-									CString displayData = receivedData;
-									if (displayData.GetLength() > 300)
-									{
-										displayData = displayData.Left(300) + _T("...");
-									}
-									
-									// Update status with received data
-									SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, 
-										_T("RELIANCE-NSE Quote: ") + displayData);
-									
-									// Wait to show the data
-									Sleep(3000);
+									SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+										_T("WebSocket connection successful!"));
 								}
 								else
 								{
-									// No market data received
-									SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, 
-										_T("Subscribed to RELIANCE-NSE but no quote data received. Market may be closed."));
-									Sleep(1000);
+									SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+										_T("WebSocket connection successful (authenticated)"));
 								}
-								
-								// Now unsubscribe
-								CString unsubMsg = _T("{\"action\":\"unsubscribe\",\"symbol\":\"RELIANCE\",\"exchange\":\"NSE\",\"mode\":2}");
-								SendWebSocketFrame(sock, unsubMsg);
-								
-								bSuccess = TRUE; // Full test completed successfully
+
+								bSuccess = TRUE;
+							}
+							else
+							{
+								SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+									_T("Connected but subscription test failed"));
 							}
 						}
 						else
 						{
-							SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("Authentication failed. Check your API key."));
+							SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+								_T("WebSocket connection failed: Authentication rejected"));
 						}
 					}
 					else
 					{
-						SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("No authentication response received."));
+						SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+							_T("WebSocket connection failed: No auth response"));
 					}
 				}
 				else
 				{
-					SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC, _T("Failed to send authentication message."));
+					SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+						_T("WebSocket connection failed: Auth send failed"));
 				}
+			}
+			else
+			{
+				SetDlgItemText(IDC_WEBSOCKET_STATUS_STATIC,
+					_T("WebSocket connection failed: Upgrade failed"));
 			}
 		}
 
