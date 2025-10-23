@@ -152,6 +152,7 @@ Refresh:
   - Fetch today's data only
   - Merge with existing data
   - Handle duplicates intelligently
+  - Sort chronologically (NEW in v1.0.0)
 ```
 
 **Duplicate Detection Algorithm:**
@@ -160,6 +161,26 @@ if (abs(timestamp1 - timestamp2) < 60) {
     // Timestamps within 60 seconds = duplicate
     // Update existing bar instead of adding new
 }
+```
+
+**Timestamp Normalization (v1.0.0):**
+```cpp
+// For 1-minute bars, normalize sub-minute fields
+if (nPeriodicity == 60) {
+    pQuotes[i].DateTime.PackDate.Second = 0;
+    pQuotes[i].DateTime.PackDate.MilliSec = 0;
+    pQuotes[i].DateTime.PackDate.MicroSec = 0;
+}
+// Prevents freak candles during live updates
+```
+
+**Chronological Sorting (v1.0.0):**
+```cpp
+// After merging data, sort by timestamp
+if (quoteIndex > 0) {
+    qsort(pQuotes, quoteIndex, sizeof(struct Quotation), CompareQuotations);
+}
+// Ensures proper order for Quote Editor display
 ```
 
 ## Data Flow Architecture
@@ -441,6 +462,28 @@ GetOpenAlgoQuote()          // Quote retrieval
 - **Leak Prevention**: Matching allocate/free pairs
 - **Thread Safety**: Critical sections for shared data
 
+## Recent Improvements (v1.0.0)
+
+### Critical Fixes Implemented
+
+#### 1. Freak Candles Fix
+**Issue**: Random spike candles during live updates
+**Cause**: Non-normalized seconds in 1-minute timestamps
+**Solution**: Timestamp normalization (Plugin.cpp:708-717)
+**Status**: ✅ Fixed
+
+#### 2. Timestamp Sorting Fix
+**Issue**: Mixed-up timestamps in Quote Editor
+**Cause**: No sorting after data merge
+**Solution**: Added qsort() implementation (Plugin.cpp:880-886)
+**Status**: ✅ Fixed
+
+#### 3. WebSocket Status Display
+**Issue**: Garbled Unicode characters
+**Cause**: Character encoding problems
+**Solution**: Simplified to plain text messages
+**Status**: ✅ Fixed
+
 ## Known Issues and Limitations
 
 ### Current Limitations
@@ -454,6 +497,11 @@ GetOpenAlgoQuote()          // Quote retrieval
 2. **Code Duplication**: WebSocket frame handling
 3. **Magic Numbers**: Hardcoded buffer sizes
 4. **Global Variables**: Extensive use of globals
+
+### Recently Resolved (v1.0.0)
+1. ~~Freak candles during live updates~~ → **FIXED**
+2. ~~Timestamp sorting issues~~ → **FIXED**
+3. ~~WebSocket status display~~ → **FIXED**
 
 ## Future Architecture Enhancements
 

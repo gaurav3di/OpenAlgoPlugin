@@ -240,8 +240,14 @@ HTTP API  WebSocket
 3. Sends HTTP request to history endpoint
 4. Parses JSON response
 5. Converts timestamps to AmiBroker format
-6. Handles duplicates intelligently
-7. Returns quote array to AmiBroker
+6. **NEW (v1.0.0)**: Normalizes timestamps for 1-minute bars
+   - Sets Second, MilliSec, MicroSec to 0
+   - Prevents "freak candles" during live updates
+7. Handles duplicates intelligently
+8. **NEW (v1.0.0)**: Sorts quotes chronologically using qsort()
+   - Ensures proper timestamp order
+   - Fixes mixed-up timestamps in Quote Editor
+9. Returns sorted quote array to AmiBroker
 
 ## Plugin Components
 
@@ -355,6 +361,8 @@ Returns plugin metadata to AmiBroker
 - **Duplicate Detection**: Compare timestamps within 60 seconds
 - **Incremental Updates**: Refresh only today's data
 - **Non-blocking I/O**: WebSocket uses async operations
+- **Timestamp Normalization** (v1.0.0): 1-minute bars normalized to prevent duplicates
+- **Chronological Sorting** (v1.0.0): Automatic qsort() after data merge
 
 ### Memory Management
 - **Dynamic Allocation**: Based on data size
@@ -431,6 +439,50 @@ Returns plugin metadata to AmiBroker
 - Right-click status area for manual control
 - Check AmiBroker log for errors
 - Use configuration dialog test buttons
+
+## Recent Enhancements (v1.0.0)
+
+### Critical Bug Fixes
+
+#### 1. Timestamp Normalization for 1-Minute Bars
+**Location**: `Plugin.cpp:708-717`
+
+**Problem**: "Freak candles" appeared during live updates due to varying seconds in timestamps
+
+**Solution**: Normalize Second, MilliSec, MicroSec fields to 0 for 1-minute bars
+```cpp
+if (nPeriodicity == 60) // 1-minute data
+{
+    pQuotes[quoteIndex].DateTime.PackDate.Second = 0;
+    pQuotes[quoteIndex].DateTime.PackDate.MilliSec = 0;
+    pQuotes[quoteIndex].DateTime.PackDate.MicroSec = 0;
+}
+```
+
+#### 2. Chronological Sorting
+**Location**: `Plugin.cpp:123-139, 880-886`
+
+**Problem**: Timestamps mixed up when filling data gaps
+
+**Solution**: Added qsort() with custom comparator after data merge
+```cpp
+int CompareQuotations(const void* a, const void* b)
+{
+    const struct Quotation* qa = (const struct Quotation*)a;
+    const struct Quotation* qb = (const struct Quotation*)b;
+
+    if (qa->DateTime.Date < qb->DateTime.Date) return -1;
+    else if (qa->DateTime.Date > qb->DateTime.Date) return 1;
+    else return 0;
+}
+```
+
+#### 3. WebSocket Status Simplification
+**Location**: `OpenAlgoConfigDlg.cpp:503-541`
+
+**Problem**: Unicode characters displayed as garbled text
+
+**Solution**: Removed Unicode icons, use simple text messages
 
 ## Future Enhancements
 
