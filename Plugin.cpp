@@ -537,6 +537,15 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 			CTimeSpan gap = todayDate - lastBarDate;
 			int gapDays = (int)gap.GetDays();
 
+			// DEBUG: Log backfill info for diagnosis
+			//CString debugMsg;
+			//debugMsg.Format(_T("BACKFILL - Symbol: %s, GapDays: %d, LastBar: %s, Today: %s, Periodicity: %d"),
+			//	pszTicker, gapDays,
+			//	lastBarDate.Format(_T("%Y-%m-%d")).GetString(),
+			//	todayDate.Format(_T("%Y-%m-%d")).GetString(),
+			//	nPeriodicity);
+			//OutputDebugString(debugMsg);
+
 			// Apply different logic for Daily vs Intraday data
 			if (nPeriodicity == 60)  // 1-minute data
 			{
@@ -609,6 +618,12 @@ skip_gap_detection:
 		CString startDate = startTime.Format(_T("%Y-%m-%d"));
 		CString endDate = endTime.Format(_T("%Y-%m-%d"));
 
+		// DEBUG: Log API request details
+		//CString apiDebugMsg;
+		//apiDebugMsg.Format(_T("API REQUEST - Symbol: %s, Exchange: %s, Interval: %s, Start: %s, End: %s"),
+		//	(LPCTSTR)symbol, (LPCTSTR)exchange, (LPCTSTR)interval, (LPCTSTR)startDate, (LPCTSTR)endDate);
+		//OutputDebugString(apiDebugMsg);
+
 		CString oPostData;
 		oPostData.Format(_T("{\"apikey\":\"%s\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"interval\":\"%s\",\"start_date\":\"%s\",\"end_date\":\"%s\"}"),
 			(LPCTSTR)g_oApiKey, (LPCTSTR)symbol, (LPCTSTR)exchange, (LPCTSTR)interval, (LPCTSTR)startDate, (LPCTSTR)endDate);
@@ -667,25 +682,53 @@ skip_gap_detection:
 								int dataEnd = oResponse.Find(_T("]"), dataStart);
 								if (dataEnd < 0) dataEnd = oResponse.GetLength();
 								CString dataArray = oResponse.Mid(dataStart, dataEnd - dataStart);
-								
+
+								// DEBUG: Log data received
+								//CString dataDebugMsg;
+								//dataDebugMsg.Format(_T("API RESPONSE - DataLength: %d bytes"), dataArray.GetLength());
+								//OutputDebugString(dataDebugMsg);
+
 								// Debug: Check if we have meaningful data
 								if (dataArray.GetLength() < 10)
 								{
 									// Very little data, might be an issue
+									//OutputDebugString(_T("WARNING: Very little data received from API"));
 									return nLastValid + 1;
 								}
 
 								// Parse each candle and merge with existing data
 								int quoteIndex = 0;
 								int pos = 0;
-								
+								int originalLastValid = nLastValid;  // Save for accurate counting
+
 								// If we have existing data, we'll need to merge properly
 								BOOL bHasExistingData = (nLastValid >= 0);
 								if (bHasExistingData)
 								{
+									// CRITICAL: Check if array is near full before adding new data
+									// If array is 95% full, remove oldest 10% to make room for new bars
+									const int ARRAY_THRESHOLD = (int)(nSize * 0.95);  // 95% full
+									const int BARS_TO_REMOVE = (int)(nSize * 0.10);   // Remove 10%
+
+									if (nLastValid >= ARRAY_THRESHOLD)
+									{
+										// Array is nearly full - shift data to remove oldest bars
+										memmove(pQuotes, pQuotes + BARS_TO_REMOVE, (nLastValid - BARS_TO_REMOVE + 1) * sizeof(struct Quotation));
+										nLastValid -= BARS_TO_REMOVE;
+
+										// DEBUG: Log array cleanup
+										//CString cleanupMsg;
+										//cleanupMsg.Format(_T("ARRAY CLEANUP - Removed %d oldest bars, New nLastValid: %d"), BARS_TO_REMOVE, nLastValid);
+										//OutputDebugString(cleanupMsg);
+									}
+
 									// Start appending after existing data
 									quoteIndex = nLastValid + 1;
 								}
+
+								// Count duplicates for debugging
+								int duplicateCount = 0;
+								int uniqueCount = 0;
 
 								while (pos < dataArray.GetLength() && quoteIndex < nSize)
 								{
@@ -811,8 +854,15 @@ skip_gap_detection:
 											BOOL bNewBarIsEOD = (pQuotes[quoteIndex].DateTime.PackDate.Hour == DATE_EOD_HOURS &&
 											                     pQuotes[quoteIndex].DateTime.PackDate.Minute == DATE_EOD_MINUTES);
 
-											// Check against existing bars (check reasonable range)
-											for (int i = max(0, nLastValid - 100); i <= nLastValid; i++)
+											// Check against ALL existing bars for same-day duplicates
+											// CRITICAL: After sorting, today's bars are scattered throughout array
+											// Must check entire array, not just "last N bars by index"
+											// Optimization: array is sorted, so stop when date changes
+											int newBarYear = pQuotes[quoteIndex].DateTime.PackDate.Year;
+											int newBarMonth = pQuotes[quoteIndex].DateTime.PackDate.Month;
+											int newBarDay = pQuotes[quoteIndex].DateTime.PackDate.Day;
+
+											for (int i = nLastValid; i >= 0; i--)
 											{
 												// SOLUTION 2: Filter by periodicity - Never compare across interval types
 												BOOL bExistingBarIsEOD = (pQuotes[i].DateTime.PackDate.Hour == DATE_EOD_HOURS &&
@@ -821,6 +871,14 @@ skip_gap_detection:
 												// Skip if different interval types (EOD vs Intraday)
 												if (bNewBarIsEOD != bExistingBarIsEOD)
 													continue;
+
+												// Optimization: Since sorted by time, if existing bar is older than new bar's date, stop searching
+												if (pQuotes[i].DateTime.PackDate.Year < newBarYear ||
+												    (pQuotes[i].DateTime.PackDate.Year == newBarYear && pQuotes[i].DateTime.PackDate.Month < newBarMonth) ||
+												    (pQuotes[i].DateTime.PackDate.Year == newBarYear && pQuotes[i].DateTime.PackDate.Month == newBarMonth && pQuotes[i].DateTime.PackDate.Day < newBarDay))
+												{
+													break;  // No more bars from same day
+												}
 
 												// SOLUTION 3: Direct PackDate comparison instead of mktime()
 												BOOL bSameBar = FALSE;
@@ -862,6 +920,11 @@ skip_gap_detection:
 										if (!bIsDuplicate)
 										{
 											quoteIndex++;
+											uniqueCount++;
+										}
+										else
+										{
+											duplicateCount++;
 										}
 									}
 
@@ -893,6 +956,12 @@ skip_gap_detection:
 									memmove(pQuotes, pQuotes + excessBars, nSize * sizeof(struct Quotation));
 									quoteIndex = nSize;
 								}
+
+								// DEBUG: Log final result
+								//CString resultDebugMsg;
+								//resultDebugMsg.Format(_T("BACKFILL COMPLETE - Total: %d, Original: %d, Unique: %d, Duplicates: %d"),
+								//	quoteIndex, originalLastValid + 1, uniqueCount, duplicateCount);
+								//OutputDebugString(resultDebugMsg);
 
 								return quoteIndex;
 							}
