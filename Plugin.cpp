@@ -478,6 +478,15 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 		CTime startTime;
 		CTime endTime = todayDate;  // Request up to today for both Daily and Intraday
 
+		// Check if manual backfill was requested - override normal logic
+		if (g_bBackfillRequested && g_nBackfillPeriodicity == nPeriodicity && g_nBackfillDays > 0)
+		{
+			// Manual backfill - fetch full requested period regardless of existing data
+			startTime = todayDate - CTimeSpan((LONG)g_nBackfillDays, 0, 0, 0);
+			g_bBackfillRequested = FALSE;  // Clear the request
+			goto skip_gap_detection;
+		}
+
 		// SMART GAP-FREE BACKFILL LOGIC WITH MIXED EOD/INTRADAY SUPPORT
 		if (nLastValid >= 0 && pQuotes != NULL)
 		{
@@ -1528,42 +1537,36 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 				g_nBackfillDays = 90;
 				g_nBackfillPeriodicity = 60;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 3 months of 1-minute data.\n\nPlease wait while data is being fetched..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 106: // 3 Months - All Symbols
 				g_nBackfillDays = 90;
 				g_nBackfillPeriodicity = 60;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 3 months of 1-minute data.\n\nThis may take several minutes. Please wait..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 107: // 6 Months - Current Symbol
 				g_nBackfillDays = 180;
 				g_nBackfillPeriodicity = 60;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 6 months of 1-minute data.\n\nPlease wait while data is being fetched..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 108: // 6 Months - All Symbols
 				g_nBackfillDays = 180;
 				g_nBackfillPeriodicity = 60;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 6 months of 1-minute data.\n\nThis may take several minutes. Please wait..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 109: // 1 Year - Current Symbol
 				g_nBackfillDays = 365;
 				g_nBackfillPeriodicity = 60;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 1 year of 1-minute data.\n\nPlease wait while data is being fetched..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 110: // 1 Year - All Symbols
 				g_nBackfillDays = 365;
 				g_nBackfillPeriodicity = 60;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 1 year of 1-minute data.\n\nThis may take several minutes. Please wait..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 
@@ -1572,42 +1575,36 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 				g_nBackfillDays = 1825;  // 5 * 365
 				g_nBackfillPeriodicity = 86400;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 5 years of daily data.\n\nPlease wait while data is being fetched..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 202: // 5 Years - All Symbols
 				g_nBackfillDays = 1825;
 				g_nBackfillPeriodicity = 86400;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 5 years of daily data.\n\nThis may take several minutes. Please wait..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 203: // 10 Years - Current Symbol
 				g_nBackfillDays = 3650;  // 10 * 365
 				g_nBackfillPeriodicity = 86400;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 10 years of daily data.\n\nPlease wait while data is being fetched..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 204: // 10 Years - All Symbols
 				g_nBackfillDays = 3650;
 				g_nBackfillPeriodicity = 86400;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 10 years of daily data.\n\nThis may take several minutes. Please wait..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 205: // 25 Years - Current Symbol
 				g_nBackfillDays = 9125;  // 25 * 365
 				g_nBackfillPeriodicity = 86400;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 25 years of daily data.\n\nPlease wait while data is being fetched..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			case 206: // 25 Years - All Symbols
 				g_nBackfillDays = 9125;
 				g_nBackfillPeriodicity = 86400;
 				g_bBackfillRequested = TRUE;
-				MessageBox(g_hAmiBrokerWnd, _T("Backfilling 25 years of daily data.\n\nThis may take several minutes. Please wait..."), _T("OpenAlgo Backfill"), MB_OK | MB_ICONINFORMATION);
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			}
