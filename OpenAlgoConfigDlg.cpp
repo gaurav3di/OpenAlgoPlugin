@@ -113,6 +113,10 @@ void COpenAlgoConfigDlg::OnOK()
 	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), g_nRefreshInterval);
 	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("TimeShift"), g_nTimeShift);
 
+	// Save real-time candles settings (declared in OpenAlgoGlobals.h)
+	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("EnableRealTimeCandles"), g_bRealTimeCandlesEnabled ? 1 : 0);
+	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("BackfillIntervalMs"), g_nBackfillIntervalMs);
+
 	CDialog::OnOK();
 }
 

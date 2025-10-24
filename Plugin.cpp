@@ -20,6 +20,7 @@
 // Timer IDs
 #define TIMER_INIT 198
 #define TIMER_REFRESH 199
+#define TIMER_WEBSOCKET 200  // High-frequency timer for WebSocket data processing
 #define RETRY_COUNT 8
 
 ////////////////////////////////////////
@@ -93,6 +94,55 @@ static CMap<CString, LPCTSTR, QuoteCache, QuoteCache&> g_QuoteCache;
 
 typedef CArray< struct Quotation, struct Quotation > CQuoteArray;
 
+//////////////////////////////////////////////////////////
+// REAL-TIME CANDLE BUILDING STRUCTURES
+//////////////////////////////////////////////////////////
+
+// Real-time configuration (non-static so they can be accessed from OpenAlgoConfigDlg)
+BOOL g_bRealTimeCandlesEnabled = TRUE;  // Default: enabled
+int g_nBackfillIntervalMs = 5000;       // HTTP backfill every 5 seconds
+
+// BarBuilder: Per-symbol tick-to-bar aggregation state
+struct BarBuilder {
+	CString symbol;
+	CString exchange;
+	int periodicity;  // 60 for 1-minute (only 1-minute supported initially)
+
+	// Current bar being built from ticks
+	struct Quotation currentBar;
+	BOOL bBarStarted;
+	time_t barStartTime;
+
+	// Tick accumulation
+	float volumeAccumulator;  // Sum of last_trade_quantity
+	int tickCount;
+
+	// Historical bars storage
+	CArray<struct Quotation, struct Quotation> bars;  // Up to 10,000 bars
+	int maxBars;
+
+	// Timestamps for backfill management
+	DWORD lastTickTime;      // Last tick received
+	DWORD lastBackfillTime;  // Last HTTP backfill
+
+	// State flags
+	BOOL bBackfillMerged;
+	BOOL bFirstTickReceived;
+
+	// Constructor
+	BarBuilder() : periodicity(60), bBarStarted(FALSE), barStartTime(0),
+	               volumeAccumulator(0.0f), tickCount(0), maxBars(10000),
+	               lastTickTime(0), lastBackfillTime(0),
+	               bBackfillMerged(FALSE), bFirstTickReceived(FALSE) {
+		memset(&currentBar, 0, sizeof(struct Quotation));
+	}
+};
+
+// Global cache of bar builders (one per symbol)
+static CMap<CString, LPCTSTR, BarBuilder*, BarBuilder*> g_BarBuilders;
+static CRITICAL_SECTION g_BarBuilderCriticalSection;
+static BOOL g_bBarBuilderCriticalSectionInitialized = FALSE;
+
 // Forward declarations
 VOID CALLBACK OnTimerProc(HWND, UINT, UINT_PTR, DWORD);
 void SetupRetry(void);
@@ -115,6 +165,12 @@ BOOL UnsubscribeFromSymbol(LPCTSTR pszTicker);
 BOOL ProcessWebSocketData(void);
 void GenerateWebSocketMaskKey(unsigned char* maskKey);
 void SubscribePendingSymbols(void);
+
+// Real-time candle building functions
+BOOL ProcessTick(const CString& symbol, const CString& exchange, float ltp, float lastTradeQty, time_t timestamp);
+time_t ParseISO8601Timestamp(const CString& isoTimestamp);
+BarBuilder* GetOrCreateBarBuilder(const CString& ticker);
+void CleanupBarBuilders(void);
 
 // Helper function for mixed EOD/Intraday data
 int FindLastBarOfMatchingType(int nPeriodicity, int nLastValid, struct Quotation* pQuotes);
@@ -1070,6 +1126,9 @@ PLUGINAPI int Init(void)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
+	// ALWAYS log initialization
+	OutputDebugString(_T("OpenAlgo: Init() called"));
+
 	if (!g_bPluginInitialized)
 	{
 		// Initialize on first call
@@ -1080,17 +1139,46 @@ PLUGINAPI int Init(void)
 		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
 		g_nTimeShift = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("TimeShift"), 0);
 
+		// Real-time candle building settings
+		g_bRealTimeCandlesEnabled = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("EnableRealTimeCandles"), 1);  // Default: enabled
+		g_nBackfillIntervalMs = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("BackfillIntervalMs"), 5000);  // Default: 5 seconds
+
 		g_nStatus = STATUS_WAIT;
 		g_bPluginInitialized = TRUE;
 
 		// Initialize quote cache
 		g_QuoteCache.InitHashTable(997); // Prime number for better hash distribution
-		
+
 		// Initialize critical section for WebSocket operations
 		InitializeCriticalSection(&g_WebSocketCriticalSection);
 		g_bCriticalSectionInitialized = TRUE;
+
+		// Initialize critical section for BarBuilder operations
+		InitializeCriticalSection(&g_BarBuilderCriticalSection);
+		g_bBarBuilderCriticalSectionInitialized = TRUE;
+
+		// Initialize BarBuilders hash table
+		g_BarBuilders.InitHashTable(503);  // Prime number for better distribution
+
+		// Log real-time settings
+		CString rtMsg;
+		rtMsg.Format(_T("OpenAlgo: Real-Time Candles Enabled = %d, Backfill Interval = %d ms"),
+			g_bRealTimeCandlesEnabled, g_nBackfillIntervalMs);
+		OutputDebugString(rtMsg);
+
+		// Initialize WebSocket connection early (don't wait for GetRecentInfo)
+		OutputDebugString(_T("OpenAlgo: Init() - Initializing WebSocket connection..."));
+		if (InitializeWebSocket())
+		{
+			OutputDebugString(_T("OpenAlgo: Init() - WebSocket initialized successfully"));
+		}
+		else
+		{
+			OutputDebugString(_T("OpenAlgo: Init() - WebSocket initialization failed (will retry later)"));
+		}
 	}
 
+	OutputDebugString(_T("OpenAlgo: Init() completed successfully"));
 	return 1;
 }
 
@@ -1103,12 +1191,21 @@ PLUGINAPI int Release(void)
 
 	// Clear cache
 	g_QuoteCache.RemoveAll();
-	
-	// Clean up critical section
+
+	// Clean up BarBuilders
+	CleanupBarBuilders();
+
+	// Clean up critical sections
 	if (g_bCriticalSectionInitialized)
 	{
 		DeleteCriticalSection(&g_WebSocketCriticalSection);
 		g_bCriticalSectionInitialized = FALSE;
+	}
+
+	if (g_bBarBuilderCriticalSectionInitialized)
+	{
+		DeleteCriticalSection(&g_BarBuilderCriticalSection);
+		g_bBarBuilderCriticalSectionInitialized = FALSE;
 	}
 
 	return 1;
@@ -1383,6 +1480,17 @@ VOID CALLBACK OnTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
+	// High-frequency WebSocket data processing timer (every 100ms)
+	if (idEvent == TIMER_WEBSOCKET)
+	{
+		// Process WebSocket data if real-time candles are enabled
+		if (g_bRealTimeCandlesEnabled && g_bWebSocketConnected)
+		{
+			ProcessWebSocketData();
+		}
+		return;
+	}
+
 	if (idEvent == TIMER_INIT || idEvent == TIMER_REFRESH)
 	{
 		if (!TestOpenAlgoConnection())
@@ -1436,6 +1544,15 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 		if (g_hAmiBrokerWnd != NULL)
 		{
 			SetTimer(g_hAmiBrokerWnd, TIMER_INIT, 1000, (TIMERPROC)OnTimerProc);
+
+			// Start high-frequency WebSocket timer (100ms) for continuous tick processing
+			// This ensures we read WebSocket data continuously, not just when GetQuotesEx() is called
+			if (g_bRealTimeCandlesEnabled)
+			{
+				SetTimer(g_hAmiBrokerWnd, TIMER_WEBSOCKET, 100, (TIMERPROC)OnTimerProc);
+				OutputDebugString(_T("OpenAlgo: Started TIMER_WEBSOCKET (100ms) for continuous tick processing"));
+			}
+
 			// Force immediate status update
 			::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 		}
@@ -1448,6 +1565,7 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 		{
 			KillTimer(g_hAmiBrokerWnd, TIMER_INIT);
 			KillTimer(g_hAmiBrokerWnd, TIMER_REFRESH);
+			KillTimer(g_hAmiBrokerWnd, TIMER_WEBSOCKET);
 		}
 		g_hAmiBrokerWnd = NULL;
 		g_nStatus = STATUS_SHUTDOWN;
@@ -1701,7 +1819,284 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 
 		// Step 2: Fetch 1-minute intraday data (chronologically newest)
 		// This appends after Daily data, maintaining chronological order
-		nQty = GetOpenAlgoHistory(pszTicker, 60, nQty - 1, nSize, pQuotes);
+		//
+		// REAL-TIME ENHANCEMENT: If real-time candles enabled, merge with tick bars
+		if (g_bRealTimeCandlesEnabled)
+		{
+			static int s_gqeCallCount = 0;
+			s_gqeCallCount++;
+
+			CString gqeLog;
+			gqeLog.Format(_T("OpenAlgo: GetQuotesEx() #%d called for %s (periodicity=%d)"),
+				s_gqeCallCount, pszTicker, nPeriodicity);
+			OutputDebugString(gqeLog);
+
+			// NOTE: WebSocket data is now processed by TIMER_WEBSOCKET (every 100ms)
+			// No need to call ProcessWebSocketData() here - it runs continuously in background
+			// This ensures ticks are processed immediately when they arrive, not just when GetQuotesEx() is called
+
+			CString ticker(pszTicker);
+			BarBuilder* pBuilder = NULL;
+
+			// CRITICAL: Subscribe to symbol if not already subscribed
+			// This ensures chart-only symbols (without quote window) also get ticks
+			BOOL bSubscribed = FALSE;
+			EnterCriticalSection(&g_WebSocketCriticalSection);
+			if (!g_SubscribedSymbols.Lookup(ticker, bSubscribed))
+			{
+				OutputDebugString(_T("OpenAlgo: GetQuotesEx - Symbol NOT subscribed, subscribing now..."));
+				if (g_bWebSocketConnected && SubscribeToSymbol(pszTicker))
+				{
+					g_SubscribedSymbols.SetAt(ticker, TRUE);
+					OutputDebugString(_T("OpenAlgo: GetQuotesEx - Successfully subscribed to symbol"));
+				}
+				else
+				{
+					OutputDebugString(_T("OpenAlgo: GetQuotesEx - WARNING: Failed to subscribe to symbol"));
+				}
+			}
+			LeaveCriticalSection(&g_WebSocketCriticalSection);
+
+			// Check if we have a BarBuilder for this symbol
+			if (g_BarBuilders.Lookup(ticker, pBuilder) && pBuilder != NULL)
+			{
+				OutputDebugString(_T("OpenAlgo: GetQuotesEx - BarBuilder found, entering critical section"));
+				EnterCriticalSection(&g_BarBuilderCriticalSection);
+
+				// ALWAYS fetch HTTP bars + append tick bar
+				// This ensures we always return complete, consistent data to AmiBroker
+				// HTTP call is fast (~100ms) and provides self-correcting behavior
+				OutputDebugString(_T("OpenAlgo: GetQuotesEx - Fetching HTTP backfill + tick bar..."));
+
+				// Fetch HTTP backfill data (source of truth for completed bars)
+				int httpLastValid = GetOpenAlgoHistory(pszTicker, 60, nQty - 1, nSize, pQuotes);
+
+				CString httpLog;
+				httpLog.Format(_T("OpenAlgo: ===== HTTP API RESPONSE ====="));
+				OutputDebugString(httpLog);
+				httpLog.Format(_T("OpenAlgo: HTTP returned %d bars for %s"), httpLastValid, pszTicker);
+				OutputDebugString(httpLog);
+
+				// Log last 3 HTTP bars for debugging
+				if (httpLastValid > 0)
+				{
+					int startIdx = max(0, httpLastValid - 3);
+					for (int i = startIdx; i < httpLastValid; i++)
+					{
+						AmiDate barDate = pQuotes[i].DateTime;
+						CString barLog;
+						barLog.Format(_T("OpenAlgo: HTTP Bar[%d]: %04d-%02d-%02d %02d:%02d O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f"),
+							i, barDate.PackDate.Year, barDate.PackDate.Month, barDate.PackDate.Day,
+							barDate.PackDate.Hour, barDate.PackDate.Minute,
+							pQuotes[i].Open, pQuotes[i].High, pQuotes[i].Low, pQuotes[i].Price, pQuotes[i].Volume);
+						OutputDebugString(barLog);
+					}
+				}
+
+				// CRITICAL FIX: Remove corrupted bar and duplicate timestamps from HTTP response
+				// The HTTP API has TWO bugs:
+				// 1. Returns corrupted last bar with invalid timestamp (Hour=31, Minute=63)
+				// 2. Keeps adding bars with same timestamp instead of updating
+				int cleanedBarCount = httpLastValid;
+
+				// STEP 1: Remove corrupted last bar if present
+				if (httpLastValid >= 1)
+				{
+					AmiDate lastBar = pQuotes[httpLastValid - 1].DateTime;
+
+					// Check for invalid timestamp (Hour > 23 or Minute > 59)
+					if (lastBar.PackDate.Hour > 23 || lastBar.PackDate.Minute > 59)
+					{
+						cleanedBarCount = httpLastValid - 1;
+
+						CString corruptLog;
+						corruptLog.Format(_T("OpenAlgo: CORRUPTED BAR DETECTED! Removed bar with invalid timestamp %04d-%02d-%02d %02d:%02d"),
+							lastBar.PackDate.Year, lastBar.PackDate.Month, lastBar.PackDate.Day,
+							lastBar.PackDate.Hour, lastBar.PackDate.Minute);
+						OutputDebugString(corruptLog);
+					}
+				}
+
+				// STEP 2: Remove duplicate timestamps (scan last 50 bars for comprehensive cleanup)
+				// Strategy: Scan backwards, keep LAST occurrence of each timestamp (most recent data)
+				if (cleanedBarCount >= 2)
+				{
+					int scanStart = max(0, cleanedBarCount - 50);
+					int writeIdx = cleanedBarCount - 1;  // Start from end, write backwards
+
+					// Mark which bars to keep (work backwards to keep last occurrence)
+					BOOL* keepBar = new BOOL[cleanedBarCount];
+					memset(keepBar, 0, cleanedBarCount * sizeof(BOOL));
+
+					// Always keep the last bar (after removing corrupted bar)
+					keepBar[cleanedBarCount - 1] = TRUE;
+
+					// Scan backwards from second-to-last bar
+					for (int i = cleanedBarCount - 2; i >= scanStart; i--)
+					{
+						AmiDate currDate = pQuotes[i].DateTime;
+						BOOL isDuplicate = FALSE;
+
+						// Check if this timestamp exists in any LATER bar (already processed)
+						for (int j = i + 1; j < cleanedBarCount; j++)
+						{
+							if (!keepBar[j]) continue;  // Skip bars we're already removing
+
+							AmiDate laterDate = pQuotes[j].DateTime;
+
+							if (currDate.PackDate.Year == laterDate.PackDate.Year &&
+								currDate.PackDate.Month == laterDate.PackDate.Month &&
+								currDate.PackDate.Day == laterDate.PackDate.Day &&
+								currDate.PackDate.Hour == laterDate.PackDate.Hour &&
+								currDate.PackDate.Minute == laterDate.PackDate.Minute)
+							{
+								// Duplicate found - a later bar has same timestamp
+								// Keep the LATER bar (more recent data), remove this one
+								isDuplicate = TRUE;
+
+								CString dupLog;
+								dupLog.Format(_T("OpenAlgo: Removing duplicate bar[%d] at %04d-%02d-%02d %02d:%02d (keeping bar[%d] with newer data)"),
+									i, currDate.PackDate.Year, currDate.PackDate.Month, currDate.PackDate.Day,
+									currDate.PackDate.Hour, currDate.PackDate.Minute, j);
+								OutputDebugString(dupLog);
+								break;
+							}
+						}
+
+						// Keep this bar if it's not a duplicate
+						if (!isDuplicate)
+						{
+							keepBar[i] = TRUE;
+						}
+					}
+
+					// Compact the array - move kept bars to front
+					int newCount = 0;
+					for (int i = 0; i < cleanedBarCount; i++)
+					{
+						if (keepBar[i])
+						{
+							if (i != newCount)
+							{
+								pQuotes[newCount] = pQuotes[i];
+							}
+							newCount++;
+						}
+					}
+
+					int removedCount = cleanedBarCount - newCount;
+					if (removedCount > 0)
+					{
+						CString summaryLog;
+						summaryLog.Format(_T("OpenAlgo: DUPLICATE CLEANUP SUMMARY: Removed %d duplicate bars"), removedCount);
+						OutputDebugString(summaryLog);
+					}
+
+					cleanedBarCount = newCount;
+					delete[] keepBar;
+				}
+
+				httpLastValid = cleanedBarCount;
+				httpLog.Format(_T("OpenAlgo: After cleanup: %d bars (removed corrupted + duplicates)"), httpLastValid);
+				OutputDebugString(httpLog);
+
+				// Log tick bar data for debugging
+				if (pBuilder->bBarStarted)
+				{
+					AmiDate tickDate = pBuilder->currentBar.DateTime;
+					CString tickLog;
+					tickLog.Format(_T("OpenAlgo: ===== TICK BAR DATA ====="));
+					OutputDebugString(tickLog);
+					tickLog.Format(_T("OpenAlgo: Tick Bar: %04d-%02d-%02d %02d:%02d O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f TickCnt=%d"),
+						tickDate.PackDate.Year, tickDate.PackDate.Month, tickDate.PackDate.Day,
+						tickDate.PackDate.Hour, tickDate.PackDate.Minute,
+						pBuilder->currentBar.Open, pBuilder->currentBar.High,
+						pBuilder->currentBar.Low, pBuilder->currentBar.Price,
+						pBuilder->currentBar.Volume, pBuilder->tickCount);
+					OutputDebugString(tickLog);
+				}
+
+				// CRITICAL FIX: Check if last HTTP bar has same timestamp as tick bar
+				// If yes, REPLACE it (don't append) to avoid duplicate timestamps
+				if (httpLastValid > 0 && pBuilder->bBarStarted)
+				{
+					BOOL bReplacedLastBar = FALSE;
+					int tickBarIndex = httpLastValid;  // Default: append after HTTP bars
+
+					// Check if last HTTP bar has same timestamp as tick bar
+					if (httpLastValid > 0)
+					{
+						AmiDate lastHttpDate = pQuotes[httpLastValid - 1].DateTime;
+						AmiDate tickBarDate = pBuilder->currentBar.DateTime;
+
+						// Compare timestamps (date + time components)
+						if (lastHttpDate.PackDate.Year == tickBarDate.PackDate.Year &&
+							lastHttpDate.PackDate.Month == tickBarDate.PackDate.Month &&
+							lastHttpDate.PackDate.Day == tickBarDate.PackDate.Day &&
+							lastHttpDate.PackDate.Hour == tickBarDate.PackDate.Hour &&
+							lastHttpDate.PackDate.Minute == tickBarDate.PackDate.Minute)
+						{
+							// Same timestamp - REPLACE the last HTTP bar with tick bar
+							tickBarIndex = httpLastValid - 1;
+							bReplacedLastBar = TRUE;
+						}
+					}
+
+					// Set the tick bar (either replace last or append new)
+					if (tickBarIndex < nSize)
+					{
+						pQuotes[tickBarIndex] = pBuilder->currentBar;
+						nQty = bReplacedLastBar ? httpLastValid : (httpLastValid + 1);
+
+						CString mergeLog;
+						mergeLog.Format(_T("OpenAlgo: ===== MERGE RESULT ====="));
+						OutputDebugString(mergeLog);
+						mergeLog.Format(_T("OpenAlgo: %s tick bar at index [%d]"),
+							bReplacedLastBar ? _T("REPLACED") : _T("APPENDED"), tickBarIndex);
+						OutputDebugString(mergeLog);
+						mergeLog.Format(_T("OpenAlgo: Final bar: O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f TickCnt=%d"),
+							pBuilder->currentBar.Open, pBuilder->currentBar.High,
+							pBuilder->currentBar.Low, pBuilder->currentBar.Price,
+							pBuilder->currentBar.Volume, pBuilder->tickCount);
+						OutputDebugString(mergeLog);
+					}
+					else
+					{
+						nQty = httpLastValid;
+						OutputDebugString(_T("OpenAlgo: GetQuotesEx - No space for tick bar"));
+					}
+				}
+				else
+				{
+					nQty = httpLastValid;
+					OutputDebugString(_T("OpenAlgo: GetQuotesEx - No tick bar to append (bar not started or no space)"));
+				}
+
+				CString finalLog;
+				finalLog.Format(_T("OpenAlgo: ===== FINAL RESULT ====="));
+				OutputDebugString(finalLog);
+				finalLog.Format(_T("OpenAlgo: Returning %d total bars (HTTP + tick) for %s"), nQty, pszTicker);
+				OutputDebugString(finalLog);
+
+				LeaveCriticalSection(&g_BarBuilderCriticalSection);
+			}
+			else
+			{
+				OutputDebugString(_T("OpenAlgo: GetQuotesEx - No BarBuilder found, using pure HTTP backfill"));
+
+				// No BarBuilder yet - use pure HTTP backfill
+				nQty = GetOpenAlgoHistory(pszTicker, 60, nQty - 1, nSize, pQuotes);
+
+				CString httpLog;
+				httpLog.Format(_T("OpenAlgo: GetQuotesEx - Pure HTTP returned %d bars"), nQty);
+				OutputDebugString(httpLog);
+			}
+		}
+		else
+		{
+			// Real-time disabled - use pure HTTP backfill (original behavior)
+			nQty = GetOpenAlgoHistory(pszTicker, 60, nQty - 1, nSize, pQuotes);
+		}
 
 		return nQty;
 	}
@@ -1903,14 +2298,110 @@ CString DecodeWebSocketFrame(const char* buffer, int length)
 	// Check frame type
 	unsigned char opcode = firstByte & 0x0F;
 	
+	// Extract payload info (needed for all frame types)
+	BOOL masked = (secondByte & 0x80) != 0;
+	int payloadLen = secondByte & 0x7F;
+
 	// Handle different frame types
 	if (opcode == 0x08) // Close frame
 	{
-		return _T("CLOSE_FRAME");
+		// Extract close status code and reason from payload
+		CString closeInfo = _T("CLOSE_FRAME");
+
+		// Handle extended payload length for close frames
+		int closePos = pos;
+		if (payloadLen == 126)
+		{
+			if (closePos + 2 > length) return closeInfo;
+			payloadLen = ((unsigned char)buffer[closePos] << 8) | (unsigned char)buffer[closePos + 1];
+			closePos += 2;
+		}
+
+		// Extract masking key if present
+		unsigned char closeMaskKey[4] = {0};
+		if (masked)
+		{
+			if (closePos + 4 > length) return closeInfo;
+			memcpy(closeMaskKey, &buffer[closePos], 4);
+			closePos += 4;
+		}
+
+		// Extract status code (first 2 bytes of payload)
+		if (payloadLen >= 2 && closePos + 2 <= length)
+		{
+			unsigned char byte1 = masked ? (buffer[closePos] ^ closeMaskKey[0]) : buffer[closePos];
+			unsigned char byte2 = masked ? (buffer[closePos + 1] ^ closeMaskKey[1]) : buffer[closePos + 1];
+			int statusCode = (byte1 << 8) | byte2;
+
+			// Extract reason text if present
+			CString reason;
+			if (payloadLen > 2 && closePos + payloadLen <= length)
+			{
+				CStringA reasonA;
+				char* reasonBuf = reasonA.GetBuffer(payloadLen - 2 + 1);
+				for (int i = 2; i < payloadLen && (closePos + i) < length; i++)
+				{
+					reasonBuf[i - 2] = masked ? (buffer[closePos + i] ^ closeMaskKey[i % 4]) : buffer[closePos + i];
+				}
+				reasonBuf[payloadLen - 2] = '\0';
+				reasonA.ReleaseBuffer();
+				reason = CString(reasonA);
+			}
+
+			if (reason.IsEmpty())
+			{
+				closeInfo.Format(_T("CLOSE_FRAME (Status Code: %d)"), statusCode);
+			}
+			else
+			{
+				closeInfo.Format(_T("CLOSE_FRAME (Status Code: %d, Reason: %s)"), statusCode, reason);
+			}
+		}
+
+		return closeInfo;
 	}
 	else if (opcode == 0x09) // Ping frame
 	{
-		return _T("PING_FRAME");
+		// Extract PING payload to echo back in PONG (RFC 6455 Section 5.5.3 requirement)
+		// The Python websockets library sends PING with a 4-byte payload and expects
+		// the PONG to echo it back exactly. If we send empty PONG, server closes with code 1011.
+		CString pingResult = _T("PING_FRAME");
+
+		// Handle extended payload length
+		int pingPos = pos;
+		if (payloadLen == 126)
+		{
+			if (pingPos + 2 > length) return pingResult;
+			payloadLen = ((unsigned char)buffer[pingPos] << 8) | (unsigned char)buffer[pingPos + 1];
+			pingPos += 2;
+		}
+
+		// Extract masking key if present
+		unsigned char pingMaskKey[4] = {0};
+		if (masked)
+		{
+			if (pingPos + 4 > length) return pingResult;
+			memcpy(pingMaskKey, &buffer[pingPos], 4);
+			pingPos += 4;
+		}
+
+		// Extract payload (usually 4 bytes from Python websockets library)
+		if (payloadLen > 0 && payloadLen <= 125 && pingPos + payloadLen <= length)
+		{
+			CStringA hexPayload;
+			for (int i = 0; i < payloadLen; i++)
+			{
+				unsigned char byte = masked ? (buffer[pingPos + i] ^ pingMaskKey[i % 4]) : buffer[pingPos + i];
+				CStringA hexByte;
+				hexByte.Format("%02X", byte);
+				hexPayload += hexByte;
+			}
+
+			// Return "PING_FRAME:XXXXXXXX" where X is hex-encoded payload
+			pingResult = _T("PING_FRAME:") + CString(hexPayload);
+		}
+
+		return pingResult;
 	}
 	else if (opcode == 0x0A) // Pong frame
 	{
@@ -1920,9 +2411,6 @@ CString DecodeWebSocketFrame(const char* buffer, int length)
 	{
 		return result;
 	}
-	
-	BOOL masked = (secondByte & 0x80) != 0;
-	int payloadLen = secondByte & 0x7F;
 	
 	// Handle extended payload length
 	if (payloadLen == 126)
@@ -1936,8 +2424,8 @@ CString DecodeWebSocketFrame(const char* buffer, int length)
 		return result; // 64-bit length not supported
 	}
 	
-	// Validate payload length doesn't exceed buffer
-	if (payloadLen <= 0 || payloadLen > 4096) return result;
+	// Validate payload length doesn't exceed buffer (increased to support larger frames)
+	if (payloadLen <= 0 || payloadLen > 16000) return result;
 	
 	// Handle masking key
 	unsigned char maskKey[4] = {0};
@@ -1976,24 +2464,52 @@ CString DecodeWebSocketFrame(const char* buffer, int length)
 
 BOOL InitializeWebSocket(void)
 {
+	OutputDebugString(_T("OpenAlgo: InitializeWebSocket() called"));
+
 	if (g_bWebSocketConnected)
+	{
+		OutputDebugString(_T("OpenAlgo: InitializeWebSocket - Already connected, returning TRUE"));
 		return TRUE;
+	}
 
 	if (g_bWebSocketConnecting)
+	{
+		OutputDebugString(_T("OpenAlgo: InitializeWebSocket - Connection in progress, returning FALSE"));
 		return FALSE; // Connection in progress, don't start another
+	}
 
 	if (g_oWebSocketUrl.IsEmpty() || g_oApiKey.IsEmpty())
+	{
+		CString errMsg;
+		errMsg.Format(_T("OpenAlgo: InitializeWebSocket - FAILED: URL='%s' APIKey='%s'"),
+			g_oWebSocketUrl.IsEmpty() ? _T("EMPTY") : g_oWebSocketUrl,
+			g_oApiKey.IsEmpty() ? _T("EMPTY") : _T("SET"));
+		OutputDebugString(errMsg);
 		return FALSE;
+	}
+
+	CString startMsg;
+	startMsg.Format(_T("OpenAlgo: InitializeWebSocket - Starting connection to %s"), g_oWebSocketUrl);
+	OutputDebugString(startMsg);
 
 	// Initialize Winsock
 	WSADATA wsaData;
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
+		OutputDebugString(_T("OpenAlgo: InitializeWebSocket - WSAStartup FAILED"));
 		return FALSE;
+	}
+
+	OutputDebugString(_T("OpenAlgo: InitializeWebSocket - WSAStartup succeeded, calling ConnectWebSocket()"));
 
 	g_bWebSocketConnecting = TRUE;
 	BOOL result = ConnectWebSocket();
 	g_bWebSocketConnecting = FALSE;
-	
+
+	CString resultMsg;
+	resultMsg.Format(_T("OpenAlgo: InitializeWebSocket - ConnectWebSocket returned %d"), result);
+	OutputDebugString(resultMsg);
+
 	return result;
 }
 
@@ -2125,14 +2641,33 @@ BOOL ConnectWebSocket(void)
 
 BOOL AuthenticateWebSocket(void)
 {
+	OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket() called"));
+
 	if (!g_bWebSocketConnected)
+	{
+		OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - WebSocket NOT CONNECTED, cannot authenticate"));
 		return FALSE;
-	
+	}
+
 	// Send authentication message
 	CString authMsg = _T("{\"action\":\"authenticate\",\"api_key\":\"") + g_oApiKey + _T("\"}");
-	
+
+	// Log authentication message (mask API key for security)
+	CString logMsg;
+	if (g_oApiKey.GetLength() > 4)
+	{
+		logMsg.Format(_T("OpenAlgo: AuthenticateWebSocket - Sending auth with API key: %s...%s"),
+			g_oApiKey.Left(2), g_oApiKey.Right(2));
+	}
+	else
+	{
+		logMsg = _T("OpenAlgo: AuthenticateWebSocket - Sending auth (API key too short or empty!)");
+	}
+	OutputDebugString(logMsg);
+
 	if (SendWebSocketFrame(authMsg))
 	{
+		OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - Sent auth message, waiting for response..."));
 		// Wait for authentication response with select (for non-blocking socket)
 		fd_set readfds;
 		FD_ZERO(&readfds);
@@ -2144,25 +2679,35 @@ BOOL AuthenticateWebSocket(void)
 		
 		if (select(0, &readfds, NULL, NULL, &timeout) > 0)
 		{
+			OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - Response received from server"));
 			char authBuffer[1024];
 			int received = recv(g_websocket, authBuffer, sizeof(authBuffer) - 1, 0);
-			
+
+			CString recvLog;
+			recvLog.Format(_T("OpenAlgo: AuthenticateWebSocket - recv() returned %d bytes"), received);
+			OutputDebugString(recvLog);
+
 			if (received > 0)
 			{
 				authBuffer[received] = '\0';
 				CString authResponse = DecodeWebSocketFrame(authBuffer, received);
-				
+
+				CString respLog;
+				respLog.Format(_T("OpenAlgo: AuthenticateWebSocket - Decoded response: %s"), authResponse);
+				OutputDebugString(respLog);
+
 				// Check for success status in authentication response
 				// Look for various success indicators that OpenAlgo might send
-				if (authResponse.Find(_T("success")) >= 0 || 
+				if (authResponse.Find(_T("success")) >= 0 ||
 					authResponse.Find(_T("authenticated")) >= 0 ||
 					authResponse.Find(_T("\"status\":\"ok\"")) >= 0 ||
 					authResponse.Find(_T("\"status\":\"success\"")) >= 0)
 				{
+					OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - Authentication SUCCESSFUL!"));
 					g_bWebSocketAuthenticated = TRUE;
 					// Small delay to ensure server has processed authentication
 					Sleep(200);
-					
+
 					// Trigger any pending subscriptions now that we're authenticated
 					SubscribePendingSymbols();
 					return TRUE;
@@ -2170,18 +2715,35 @@ BOOL AuthenticateWebSocket(void)
 				else if (authResponse.Find(_T("error")) >= 0 || authResponse.Find(_T("failed")) >= 0)
 				{
 					// Explicit authentication failure
+					OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - Authentication FAILED (error in response)"));
+					OutputDebugString(authResponse);
 					return FALSE;
 				}
+				else
+				{
+					OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - Received response but no clear success/failure indicator"));
+				}
+			}
+			else if (received == 0)
+			{
+				OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - SERVER CLOSED CONNECTION during auth!"));
+				g_bWebSocketConnected = FALSE;
+				return FALSE;
 			}
 		}
-		
+		else
+		{
+			OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - No response within 5 seconds (timeout)"));
+		}
+
 		// If we reach here, either timeout or no clear response
 		// Since authentication was sent successfully, assume success
 		// This is a fallback since the test button works with the same flow
+		OutputDebugString(_T("OpenAlgo: AuthenticateWebSocket - Assuming authentication succeeded (fallback)"));
 		g_bWebSocketAuthenticated = TRUE;
 		// Longer delay to ensure server has processed authentication
 		Sleep(1000);  // Increased delay to ensure server processes auth
-		
+
 		// Trigger any pending subscriptions now that we're authenticated
 		SubscribePendingSymbols();
 		return TRUE;
@@ -2192,19 +2754,42 @@ BOOL AuthenticateWebSocket(void)
 
 BOOL SubscribeToSymbol(LPCTSTR pszTicker)
 {
+	CString logStart;
+	logStart.Format(_T("OpenAlgo: SubscribeToSymbol called for: %s"), pszTicker);
+	OutputDebugString(logStart);
+
 	if (!g_bWebSocketConnected)
+	{
+		OutputDebugString(_T("OpenAlgo: SubscribeToSymbol - WebSocket NOT CONNECTED, cannot subscribe"));
 		return FALSE;
-	
+	}
+
 	// Extract symbol and exchange
 	CString symbol = GetCleanSymbol(pszTicker);
 	CString exchange = GetExchangeFromTicker(pszTicker);
-	
+
+	CString extractLog;
+	extractLog.Format(_T("OpenAlgo: SubscribeToSymbol - Extracted: Symbol='%s' Exchange='%s'"),
+		symbol, exchange);
+	OutputDebugString(extractLog);
+
 	// Send subscription message for quote mode (mode 2)
+	// For quotes WebSocket (not market depth), no depth field needed
 	CString subMsg;
 	subMsg.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":2}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
-	
-	return SendWebSocketFrame(subMsg);
+
+	CString msgLog;
+	msgLog.Format(_T("OpenAlgo: SubscribeToSymbol - Sending: %s"), subMsg);
+	OutputDebugString(msgLog);
+
+	BOOL result = SendWebSocketFrame(subMsg);
+
+	CString resultLog;
+	resultLog.Format(_T("OpenAlgo: SubscribeToSymbol - SendWebSocketFrame returned %d"), result);
+	OutputDebugString(resultLog);
+
+	return result;
 }
 
 BOOL UnsubscribeFromSymbol(LPCTSTR pszTicker)
@@ -2243,12 +2828,54 @@ void SubscribePendingSymbols(void)
 
 BOOL ProcessWebSocketData(void)
 {
+	// ALWAYS log that this function is called (every time)
+	static int s_callCount = 0;
+	s_callCount++;
+	if (s_callCount <= 5 || s_callCount % 100 == 0)  // Log first 5 calls and every 100th
+	{
+		CString callMsg;
+		callMsg.Format(_T("OpenAlgo: ProcessWebSocketData() call #%d - Connected=%d Socket=%d"),
+			s_callCount, g_bWebSocketConnected, (g_websocket != INVALID_SOCKET));
+		OutputDebugString(callMsg);
+	}
+
 	if (!g_bWebSocketConnected || g_websocket == INVALID_SOCKET)
+	{
+		// Auto-reconnect if disconnected
+		static DWORD lastReconnectAttempt = 0;
+		DWORD now = (DWORD)GetTickCount64();
+
+		// Try reconnecting every 5 seconds
+		if ((now - lastReconnectAttempt) > 5000)
+		{
+			lastReconnectAttempt = now;
+			OutputDebugString(_T("OpenAlgo: ProcessWebSocketData() - NOT CONNECTED, attempting reconnect..."));
+
+			if (InitializeWebSocket())
+			{
+				OutputDebugString(_T("OpenAlgo: *** AUTO-RECONNECT SUCCESSFUL! ***"));
+				return TRUE; // Continue processing
+			}
+			else
+			{
+				OutputDebugString(_T("OpenAlgo: Auto-reconnect failed, will retry in 5 seconds"));
+			}
+		}
 		return FALSE;
-	
+	}
+
 	// Send periodic ping to keep connection alive
 	static DWORD lastPingTime = 0;
+	static BOOL pingTimerInitialized = FALSE;
 	DWORD currentTime = (DWORD)GetTickCount64();
+
+	// Initialize timer on first call (don't send PING immediately)
+	if (!pingTimerInitialized)
+	{
+		lastPingTime = currentTime;
+		pingTimerInitialized = TRUE;
+	}
+
 	if ((currentTime - lastPingTime) > 30000) // Ping every 30 seconds
 	{
 		// Send WebSocket ping frame (opcode 0x09)
@@ -2256,75 +2883,205 @@ BOOL ProcessWebSocketData(void)
 		GenerateWebSocketMaskKey(&pingFrame[2]);
 		send(g_websocket, (char*)pingFrame, 6, 0);
 		lastPingTime = currentTime;
+		OutputDebugString(_T("OpenAlgo: Sent WebSocket ping"));
 	}
 	
-	// Check for incoming data (non-blocking)
-	fd_set readfds;
-	FD_ZERO(&readfds);
-	FD_SET(g_websocket, &readfds);
-	
-	struct timeval timeout;
-	timeout.tv_sec = 0;
-	timeout.tv_usec = 0; // Non-blocking
-	
-	if (select(0, &readfds, NULL, NULL, &timeout) > 0)
+	// CRITICAL: Read ALL pending data in a loop
+	// The server sends subscription ACKs and market data continuously
+	// We must drain the receive buffer or the server will close the connection!
+	int messagesProcessed = 0;
+	const int MAX_MESSAGES_PER_CALL = 100; // Prevent infinite loop
+
+	while (messagesProcessed < MAX_MESSAGES_PER_CALL)
 	{
-		char buffer[2048];
+		// Check for incoming data (non-blocking)
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		FD_SET(g_websocket, &readfds);
+
+		struct timeval timeout;
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 0; // Non-blocking
+
+		int selectResult = select(0, &readfds, NULL, NULL, &timeout);
+
+		if (selectResult <= 0)
+		{
+			// No more data available
+			if (messagesProcessed > 0)
+			{
+				CString doneMsg;
+				doneMsg.Format(_T("OpenAlgo: Processed %d messages this call"), messagesProcessed);
+				OutputDebugString(doneMsg);
+			}
+			break;
+		}
+
+		messagesProcessed++;
+
+		if (selectResult > 0)
+	{
+		// Increased buffer size to 16KB to handle large WebSocket frames without fragmentation
+		// This prevents misinterpreting partial frames as CLOSE frames
+		char buffer[16384];
 		int received = recv(g_websocket, buffer, sizeof(buffer) - 1, 0);
+
+		CString recvMsg;
+		recvMsg.Format(_T("OpenAlgo: recv() returned %d bytes"), received);
+		OutputDebugString(recvMsg);
 		
 		if (received > 0)
 		{
 			CString data = DecodeWebSocketFrame(buffer, received);
-			
-			// Handle WebSocket control frames
-			if (data == _T("PING_FRAME"))
+
+			// CRITICAL: Log decoded result FIRST (including control frames for debugging)
+			CString decodeLog;
+			if (data.IsEmpty())
 			{
-				// Send pong response
-				unsigned char pongFrame[6] = {0x8A, 0x84, 0x00, 0x00, 0x00, 0x00}; // Pong with 4-byte mask
-				GenerateWebSocketMaskKey(&pongFrame[2]);
-				send(g_websocket, (char*)pongFrame, 6, 0);
-				return TRUE;
+				decodeLog = _T("OpenAlgo: DecodeWebSocketFrame returned EMPTY STRING");
 			}
-			else if (data == _T("CLOSE_FRAME"))
+			else if (data == _T("PING_FRAME"))
 			{
-				// Connection closed by server
+				decodeLog = _T("OpenAlgo: DecodeWebSocketFrame returned: PING_FRAME");
+			}
+			else if (data == _T("PONG_FRAME"))
+			{
+				decodeLog = _T("OpenAlgo: DecodeWebSocketFrame returned: PONG_FRAME");
+			}
+			else if (data.Find(_T("CLOSE_FRAME")) == 0)  // Starts with "CLOSE_FRAME"
+			{
+				decodeLog.Format(_T("OpenAlgo: DecodeWebSocketFrame returned: %s"), data);
+			}
+			else
+			{
+				if (data.GetLength() > 200)
+				{
+					decodeLog.Format(_T("OpenAlgo: DecodeWebSocketFrame returned: %s... [%d chars]"),
+						data.Left(200), data.GetLength());
+				}
+				else
+				{
+					decodeLog.Format(_T("OpenAlgo: DecodeWebSocketFrame returned: %s"), data);
+				}
+			}
+			OutputDebugString(decodeLog);
+
+			// Handle WebSocket control frames
+			if (data.Find(_T("PING_FRAME")) == 0)  // Starts with "PING_FRAME"
+			{
+				// RFC 6455 Section 5.5.3: PONG must echo the PING's payload exactly
+				// Extract payload from "PING_FRAME:XXXXXXXX" format (hex-encoded)
+				CString payload;
+				int colonPos = data.Find(':');
+				if (colonPos > 0)
+				{
+					payload = data.Mid(colonPos + 1);
+				}
+
+				// Convert hex payload back to bytes
+				int payloadLen = payload.GetLength() / 2;
+				unsigned char payloadBytes[125] = {0};  // Max control frame payload size
+				for (int i = 0; i < payloadLen && i < 125; i++)
+				{
+					CString hexByte = payload.Mid(i * 2, 2);
+					payloadBytes[i] = (unsigned char)_tcstoul(hexByte, NULL, 16);
+				}
+
+				// Build PONG frame with echoed payload
+				unsigned char pongFrame[256];
+				int frameLen = 0;
+
+				pongFrame[frameLen++] = 0x8A;  // FIN + opcode 0x0A (PONG)
+				pongFrame[frameLen++] = 0x80 | payloadLen;  // MASK bit + payload length
+
+				// Generate and add masking key
+				unsigned char maskKey[4];
+				GenerateWebSocketMaskKey(maskKey);
+				memcpy(&pongFrame[frameLen], maskKey, 4);
+				frameLen += 4;
+
+				// Add masked payload (echo back the PING payload)
+				for (int i = 0; i < payloadLen; i++)
+				{
+					pongFrame[frameLen++] = payloadBytes[i] ^ maskKey[i % 4];
+				}
+
+				// Send PONG with echoed payload
+				send(g_websocket, (char*)pongFrame, frameLen, 0);
+
+				CString pongLog;
+				pongLog.Format(_T("OpenAlgo: Received PING with %d-byte payload, sent PONG with echoed payload"), payloadLen);
+				OutputDebugString(pongLog);
+
+				continue; // Continue processing more messages
+			}
+			else if (data.Find(_T("CLOSE_FRAME")) == 0)  // Starts with "CLOSE_FRAME"
+			{
+				// Connection closed by server - log the reason
+				CString closeLog;
+				closeLog.Format(_T("OpenAlgo: Received %s from server - closing connection"), data);
+				OutputDebugString(closeLog);
 				g_bWebSocketConnected = FALSE;
 				g_bWebSocketAuthenticated = FALSE;
 				closesocket(g_websocket);
 				g_websocket = INVALID_SOCKET;
-				return FALSE;
+				break; // Exit loop
 			}
 			else if (data == _T("PONG_FRAME"))
 			{
 				// Pong received, connection is alive
-				return TRUE;
+				continue; // Continue processing more messages
 			}
-			
+
+			// Handle subscription acknowledgment
+			if (!data.IsEmpty() && data.Find(_T("\"type\":\"subscribe\"")) >= 0)
+			{
+				OutputDebugString(_T("OpenAlgo: Received subscription ACK"));
+				// Subscription ACK received - just log and continue
+				// The actual subscription tracking is done when we send the subscribe message
+				continue; // Continue processing more messages
+			}
+
 			// Parse market data JSON and update cache
 			if (!data.IsEmpty() && data.Find(_T("market_data")) >= 0)
 			{
 				// Simple JSON parsing to extract quote data
-				CString symbol, exchange;
+				CString symbol, exchange, timestamp;
 				float ltp = 0, open = 0, high = 0, low = 0, close = 0, volume = 0, oi = 0;
-				
-				// Extract symbol
-				int symbolPos = data.Find(_T("\"symbol\":\""));
+				float lastTradeQty = 0;  // NEW: For real-time candle building
+
+				// Extract symbol (handle JSON with or without spaces after colon)
+				int symbolPos = data.Find(_T("\"symbol\":"));
 				if (symbolPos >= 0)
 				{
-					symbolPos += 10;
+					symbolPos += 9;  // Skip "symbol":
+					// Skip optional whitespace
+					while (symbolPos < data.GetLength() && (data[symbolPos] == ' ' || data[symbolPos] == '\t'))
+						symbolPos++;
+					// Skip opening quote
+					if (symbolPos < data.GetLength() && data[symbolPos] == '\"')
+						symbolPos++;
 					int endPos = data.Find(_T("\""), symbolPos);
-					symbol = data.Mid(symbolPos, endPos - symbolPos);
+					if (endPos > symbolPos)
+						symbol = data.Mid(symbolPos, endPos - symbolPos);
 				}
-				
-				// Extract exchange
-				int exchangePos = data.Find(_T("\"exchange\":\""));
+
+				// Extract exchange (handle JSON with or without spaces after colon)
+				int exchangePos = data.Find(_T("\"exchange\":"));
 				if (exchangePos >= 0)
 				{
-					exchangePos += 12;
+					exchangePos += 11;  // Skip "exchange":
+					// Skip optional whitespace
+					while (exchangePos < data.GetLength() && (data[exchangePos] == ' ' || data[exchangePos] == '\t'))
+						exchangePos++;
+					// Skip opening quote
+					if (exchangePos < data.GetLength() && data[exchangePos] == '\"')
+						exchangePos++;
 					int endPos = data.Find(_T("\""), exchangePos);
-					exchange = data.Mid(exchangePos, endPos - exchangePos);
+					if (endPos > exchangePos)
+						exchange = data.Mid(exchangePos, endPos - exchangePos);
 				}
-				
+
 				// Extract LTP
 				int ltpPos = data.Find(_T("\"ltp\":"));
 				if (ltpPos >= 0)
@@ -2335,11 +3092,64 @@ BOOL ProcessWebSocketData(void)
 					CString val = data.Mid(ltpPos, endPos - ltpPos);
 					ltp = (float)_tstof(val);
 				}
-				
+
+				// NEW: Extract last_trade_quantity
+				int lastTradeQtyPos = data.Find(_T("\"last_trade_quantity\":"));
+				if (lastTradeQtyPos >= 0)
+				{
+					lastTradeQtyPos += 22;
+					int endPos = data.Find(_T(","), lastTradeQtyPos);
+					if (endPos < 0) endPos = data.Find(_T("}"), lastTradeQtyPos);
+					CString val = data.Mid(lastTradeQtyPos, endPos - lastTradeQtyPos);
+					lastTradeQty = (float)_tstof(val);
+				}
+
+				// NEW: Extract timestamp (supports both Unix milliseconds and ISO 8601 string)
+				// Server sends: "timestamp":1761157800000 (Unix milliseconds, no quotes)
+				// OR: "timestamp":"2025-05-28T10:30:45.123Z" (ISO 8601 string)
+				int timestampPos = data.Find(_T("\"timestamp\":"));
+				if (timestampPos >= 0)
+				{
+					timestampPos += 12;  // Skip "timestamp":
+
+					// Check if it's a string (starts with quote) or number
+					CString nextChar = data.Mid(timestampPos, 1);
+					if (nextChar == _T("\""))
+					{
+						// ISO 8601 string format: "timestamp":"2025-05-28..."
+						timestampPos += 1;  // Skip opening quote
+						int endPos = data.Find(_T("\""), timestampPos);
+						timestamp = data.Mid(timestampPos, endPos - timestampPos);
+					}
+					else
+					{
+						// Unix milliseconds format: "timestamp":1761157800000
+						int endPos = data.Find(_T(","), timestampPos);
+						if (endPos < 0) endPos = data.Find(_T("}"), timestampPos);
+						timestamp = data.Mid(timestampPos, endPos - timestampPos);
+						timestamp.Trim();  // Remove whitespace
+					}
+				}
+
+				// ALWAYS log WebSocket data (for debugging)
+				static int s_wsCounter = 0;
+				s_wsCounter++;
+				CString debugMsg;
+				debugMsg.Format(_T("OpenAlgo: ===== WEBSOCKET TICK #%d ====="), s_wsCounter);
+				OutputDebugString(debugMsg);
+				debugMsg.Format(_T("OpenAlgo: WS Tick: Symbol=%s-%s LTP=%.2f Qty=%.0f TS=%s"),
+					symbol, exchange, ltp, lastTradeQty, timestamp);
+				OutputDebugString(debugMsg);
+				debugMsg.Format(_T("OpenAlgo: WS Data: O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f OI=%.0f"),
+					open, high, low, close, volume, oi);
+				OutputDebugString(debugMsg);
+				debugMsg.Format(_T("OpenAlgo: RT Enabled=%d"), g_bRealTimeCandlesEnabled);
+				OutputDebugString(debugMsg);
+
 				// Extract other fields similarly...
 				// (Simplified implementation - you could add more fields)
-				
-				// Update cache
+
+				// Update cache (for GetRecentInfo() compatibility)
 				if (!symbol.IsEmpty() && !exchange.IsEmpty())
 				{
 					QuoteCache quote;
@@ -2353,23 +3163,111 @@ BOOL ProcessWebSocketData(void)
 					quote.volume = volume;
 					quote.oi = oi;
 					quote.lastUpdate = (DWORD)GetTickCount64();
-					
+
 					CString ticker = symbol + _T("-") + exchange;
 					g_QuoteCache.SetAt(ticker, quote);
+
+					// NEW: Process tick for real-time candle building
+					if (g_bRealTimeCandlesEnabled && ltp > 0)
+					{
+						// If last_trade_quantity is missing or zero, use 1 as default
+						// This ensures ticks are still processed even without quantity info
+						if (lastTradeQty <= 0)
+						{
+							lastTradeQty = 1.0f;  // Default quantity
+						}
+
+						// TEMPORARY FIX: Always use current system time instead of server timestamp
+						// Server is sending incorrect/fixed timestamps (May 28 instead of current date)
+						// This ensures bars appear at the correct current time
+						time_t tickTimestamp = time(NULL);
+
+						// Debug: Log both server time and system time
+						CString timeLog;
+						if (!timestamp.IsEmpty())
+						{
+							time_t serverTime = ParseISO8601Timestamp(timestamp);
+
+							// Convert timestamps to readable format
+							struct tm serverTm, systemTm;
+							localtime_s(&serverTm, &serverTime);
+							localtime_s(&systemTm, &tickTimestamp);
+
+							CString serverTimeStr, systemTimeStr;
+							serverTimeStr.Format(_T("%04d-%02d-%02d %02d:%02d:%02d"),
+								serverTm.tm_year + 1900, serverTm.tm_mon + 1, serverTm.tm_mday,
+								serverTm.tm_hour, serverTm.tm_min, serverTm.tm_sec);
+							systemTimeStr.Format(_T("%04d-%02d-%02d %02d:%02d:%02d"),
+								systemTm.tm_year + 1900, systemTm.tm_mon + 1, systemTm.tm_mday,
+								systemTm.tm_hour, systemTm.tm_min, systemTm.tm_sec);
+
+							timeLog.Format(_T("OpenAlgo: Timestamp - Server=%s System=%s (using System)"),
+								serverTimeStr, systemTimeStr);
+							OutputDebugString(timeLog);
+						}
+
+						// Process tick and build real-time bars
+						OutputDebugString(_T("OpenAlgo: About to call ProcessTick..."));
+						BOOL result = ProcessTick(symbol, exchange, ltp, lastTradeQty, tickTimestamp);
+
+						CString resultMsg;
+						resultMsg.Format(_T("OpenAlgo: ProcessTick result = %s"), result ? _T("SUCCESS") : _T("FAILED"));
+						OutputDebugString(resultMsg);
+					}
+					else
+					{
+						CString reason;
+						reason.Format(_T("OpenAlgo: ProcessTick SKIPPED - RT_Enabled=%d LTP=%.2f"),
+							g_bRealTimeCandlesEnabled, ltp);
+						OutputDebugString(reason);
+					}
 				}
-				
-				return TRUE;
+
+				continue; // Continue processing more messages
+			}
+			else
+			{
+				// Unknown message type - just continue
+				OutputDebugString(_T("OpenAlgo: Received unknown/unhandled message type"));
+				continue;
 			}
 		}
 		else if (received == 0)
 		{
-			// Connection closed
+			// Connection closed by server (graceful close)
+			OutputDebugString(_T("OpenAlgo: ========== CRITICAL: SERVER CLOSED CONNECTION =========="));
+			OutputDebugString(_T("OpenAlgo: recv() returned 0 - server sent FIN packet (connection closed gracefully)"));
+			OutputDebugString(_T("OpenAlgo: Server closed after ~1 minute - will attempt auto-reconnect"));
+			OutputDebugString(_T("OpenAlgo: ========================================================"));
+
+			// Mark as disconnected
 			g_bWebSocketConnected = FALSE;
 			g_bWebSocketAuthenticated = FALSE;
+			closesocket(g_websocket);
+			g_websocket = INVALID_SOCKET;
+
+			// Clear subscriptions so they'll be re-subscribed on reconnect
+			EnterCriticalSection(&g_WebSocketCriticalSection);
+			g_SubscribedSymbols.RemoveAll();
+			LeaveCriticalSection(&g_WebSocketCriticalSection);
+
+			// Attempt immediate reconnection
+			OutputDebugString(_T("OpenAlgo: Attempting WebSocket reconnection..."));
+			if (InitializeWebSocket())
+			{
+				OutputDebugString(_T("OpenAlgo: *** RECONNECTED SUCCESSFULLY! ***"));
+			}
+			else
+			{
+				OutputDebugString(_T("OpenAlgo: *** RECONNECTION FAILED - will retry on next call ***"));
+			}
+
+			break; // Exit loop after reconnect attempt
 		}
 	}
-	
-	return FALSE;
+	} // End of while loop for processing messages
+
+	return (messagesProcessed > 0); // Return TRUE if we processed any messages
 }
 
 void CleanupWebSocket(void)
@@ -2411,4 +3309,255 @@ void CleanupWebSocket(void)
 	g_bWebSocketConnecting = FALSE;
 	
 	WSACleanup();
+}
+
+///////////////////////////////
+// Real-Time Candle Building Functions
+///////////////////////////////
+
+// Parse ISO 8601 timestamp (e.g., "2025-05-28T10:30:45.123Z")
+time_t ParseISO8601Timestamp(const CString& isoTimestamp)
+{
+	if (isoTimestamp.IsEmpty())
+		return time(NULL);
+
+	// Check if it's a Unix timestamp (all digits, possibly with whitespace)
+	// Example: "1761157800000" (milliseconds since epoch)
+	CString trimmed = isoTimestamp;
+	trimmed.Trim();
+
+	BOOL isNumeric = TRUE;
+	for (int i = 0; i < trimmed.GetLength(); i++)
+	{
+		if (!_istdigit(trimmed[i]))
+		{
+			isNumeric = FALSE;
+			break;
+		}
+	}
+
+	if (isNumeric)
+	{
+		// Parse as Unix timestamp in MILLISECONDS
+		__int64 milliseconds = _tstoi64(trimmed);
+
+		// Convert milliseconds to seconds
+		time_t timestamp = (time_t)(milliseconds / 1000);
+
+		return timestamp;
+	}
+
+	// Otherwise, try to parse as ISO 8601: YYYY-MM-DDTHH:MM:SS.sssZ
+	struct tm timeinfo = { 0 };
+	int year, month, day, hour, minute, second;
+
+	int count = _stscanf_s(isoTimestamp, _T("%d-%d-%dT%d:%d:%d"),
+		&year, &month, &day, &hour, &minute, &second);
+
+	if (count == 6)
+	{
+		timeinfo.tm_year = year - 1900;
+		timeinfo.tm_mon = month - 1;
+		timeinfo.tm_mday = day;
+		timeinfo.tm_hour = hour;
+		timeinfo.tm_min = minute;
+		timeinfo.tm_sec = second;
+		timeinfo.tm_isdst = -1;
+
+		// Convert to Unix timestamp
+		time_t timestamp = mktime(&timeinfo);
+
+		// Note: This assumes local time. For UTC, we'd need _mkgmtime or adjust for timezone
+		// For simplicity, using local time which matches server time in most cases
+		return timestamp;
+	}
+
+	// If all parsing fails, return current time as fallback
+	return time(NULL);
+}
+
+// Get or create BarBuilder for a ticker
+BarBuilder* GetOrCreateBarBuilder(const CString& ticker)
+{
+	BarBuilder* pBuilder = NULL;
+
+	EnterCriticalSection(&g_BarBuilderCriticalSection);
+
+	if (!g_BarBuilders.Lookup(ticker, pBuilder))
+	{
+		// Create new BarBuilder
+		pBuilder = new BarBuilder();
+
+		// Extract symbol and exchange from ticker (e.g., "RELIANCE-NSE")
+		int dashPos = ticker.ReverseFind('-');
+		if (dashPos > 0)
+		{
+			pBuilder->symbol = ticker.Left(dashPos);
+			pBuilder->exchange = ticker.Mid(dashPos + 1);
+		}
+		else
+		{
+			pBuilder->symbol = ticker;
+			pBuilder->exchange = _T("NSE");  // Default exchange
+		}
+
+		g_BarBuilders.SetAt(ticker, pBuilder);
+	}
+
+	LeaveCriticalSection(&g_BarBuilderCriticalSection);
+
+	return pBuilder;
+}
+
+// Process a tick and update bars
+BOOL ProcessTick(const CString& symbol, const CString& exchange, float ltp, float lastTradeQty, time_t timestamp)
+{
+	static int s_tickCallCount = 0;
+	s_tickCallCount++;
+
+	if (!g_bRealTimeCandlesEnabled)
+	{
+		OutputDebugString(_T("OpenAlgo: ProcessTick - Real-time candles DISABLED, exiting"));
+		return FALSE;
+	}
+
+	// Create ticker key
+	CString ticker = symbol + _T("-") + exchange;
+
+	CString tickLog;
+	tickLog.Format(_T("OpenAlgo: ProcessTick #%d START: %s LTP=%.2f Qty=%.0f TS=%lld"),
+		s_tickCallCount, ticker, ltp, lastTradeQty, (__int64)timestamp);
+	OutputDebugString(tickLog);
+
+	// Get or create BarBuilder
+	BarBuilder* pBuilder = GetOrCreateBarBuilder(ticker);
+	if (!pBuilder)
+	{
+		OutputDebugString(_T("OpenAlgo: ProcessTick - FAILED to get/create BarBuilder"));
+		return FALSE;
+	}
+
+	EnterCriticalSection(&g_BarBuilderCriticalSection);
+
+	// Determine bar boundary (1-minute intervals)
+	time_t barPeriodStart = (timestamp / 60) * 60;  // Floor to minute boundary
+
+	CString barLog;
+	barLog.Format(_T("OpenAlgo: ProcessTick - BarPeriodStart=%lld CurrentBarStart=%lld NewBar=%d"),
+		(__int64)barPeriodStart, (__int64)pBuilder->barStartTime,
+		(pBuilder->barStartTime != barPeriodStart) ? 1 : 0);
+	OutputDebugString(barLog);
+
+	// Check if we need a new bar
+	if (pBuilder->barStartTime != barPeriodStart)
+	{
+		// Finalize current bar if it exists
+		if (pBuilder->bBarStarted && pBuilder->barStartTime > 0)
+		{
+			CString finalizeLog;
+			finalizeLog.Format(_T("OpenAlgo: ProcessTick - Finalizing bar: O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f Ticks=%d"),
+				pBuilder->currentBar.Open, pBuilder->currentBar.High, pBuilder->currentBar.Low,
+				pBuilder->currentBar.Price, pBuilder->currentBar.Volume, pBuilder->tickCount);
+			OutputDebugString(finalizeLog);
+
+			// Add current bar to history
+			pBuilder->bars.Add(pBuilder->currentBar);
+
+			// Check if we need to remove old bars (rolling window)
+			if (pBuilder->bars.GetCount() >= pBuilder->maxBars)
+			{
+				// Remove oldest 10% to make room
+				int removeCount = pBuilder->maxBars / 10;
+				pBuilder->bars.RemoveAt(0, removeCount);
+				OutputDebugString(_T("OpenAlgo: ProcessTick - Removed old bars (rolling window)"));
+			}
+		}
+
+		OutputDebugString(_T("OpenAlgo: ProcessTick - Starting NEW BAR"));
+
+		// Start new bar
+		memset(&pBuilder->currentBar, 0, sizeof(struct Quotation));
+		pBuilder->currentBar.Open = ltp;
+		pBuilder->currentBar.High = ltp;
+		pBuilder->currentBar.Low = ltp;
+		pBuilder->currentBar.Price = ltp;  // Price is the Close value in Quotation struct
+		pBuilder->currentBar.Volume = 0;
+		pBuilder->currentBar.OpenInterest = 0;
+
+		// Set normalized timestamp (critical for AmiBroker)
+		ConvertUnixToPackedDate(barPeriodStart, &pBuilder->currentBar.DateTime);
+		pBuilder->currentBar.DateTime.PackDate.Second = 0;
+		pBuilder->currentBar.DateTime.PackDate.MilliSec = 0;
+		pBuilder->currentBar.DateTime.PackDate.MicroSec = 0;
+
+		pBuilder->barStartTime = barPeriodStart;
+		pBuilder->bBarStarted = TRUE;
+		pBuilder->volumeAccumulator = 0.0f;
+		pBuilder->bFirstTickReceived = TRUE;
+		pBuilder->tickCount = 0;  // Reset tick counter for new bar
+	}
+
+	// Update current bar OHLC
+	if (ltp > pBuilder->currentBar.High)
+		pBuilder->currentBar.High = ltp;
+	if (ltp < pBuilder->currentBar.Low || pBuilder->currentBar.Low == 0.0f)
+		pBuilder->currentBar.Low = ltp;
+	pBuilder->currentBar.Price = ltp;  // Price is the Close value in Quotation struct
+
+	// Accumulate volume
+	pBuilder->volumeAccumulator += lastTradeQty;
+	pBuilder->currentBar.Volume = pBuilder->volumeAccumulator;
+	pBuilder->tickCount++;
+
+	CString updateLog;
+	updateLog.Format(_T("OpenAlgo: ProcessTick - Bar UPDATED: O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f Ticks=%d"),
+		pBuilder->currentBar.Open, pBuilder->currentBar.High, pBuilder->currentBar.Low,
+		pBuilder->currentBar.Price, pBuilder->currentBar.Volume, pBuilder->tickCount);
+	OutputDebugString(updateLog);
+
+	// Update last tick time
+	pBuilder->lastTickTime = (DWORD)GetTickCount64();
+
+	LeaveCriticalSection(&g_BarBuilderCriticalSection);
+
+	// Notify AmiBroker of update (non-blocking)
+	if (g_hAmiBrokerWnd != NULL)
+	{
+		PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+		OutputDebugString(_T("OpenAlgo: ProcessTick - Sent WM_USER_STREAMING_UPDATE to AmiBroker"));
+	}
+	else
+	{
+		OutputDebugString(_T("OpenAlgo: ProcessTick - WARNING: g_hAmiBrokerWnd is NULL, cannot send update"));
+	}
+
+	OutputDebugString(_T("OpenAlgo: ProcessTick - SUCCESS, returning TRUE"));
+	return TRUE;
+}
+
+// Cleanup all BarBuilders
+void CleanupBarBuilders(void)
+{
+	if (g_bBarBuilderCriticalSectionInitialized)
+	{
+		EnterCriticalSection(&g_BarBuilderCriticalSection);
+
+		// Delete all BarBuilder objects
+		POSITION pos = g_BarBuilders.GetStartPosition();
+		while (pos != NULL)
+		{
+			CString ticker;
+			BarBuilder* pBuilder;
+			g_BarBuilders.GetNextAssoc(pos, ticker, pBuilder);
+
+			if (pBuilder)
+			{
+				delete pBuilder;
+			}
+		}
+
+		g_BarBuilders.RemoveAll();
+
+		LeaveCriticalSection(&g_BarBuilderCriticalSection);
+	}
 }

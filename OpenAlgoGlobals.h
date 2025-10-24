@@ -24,6 +24,15 @@ extern CString g_oApiKey;  // API Key for authentication
 extern CString g_oWebSocketUrl;  // WebSocket URL for real-time data
 extern int g_nStatus;
 
+// Backfill request tracking
+extern int g_nBackfillDays;
+extern int g_nBackfillPeriodicity;
+extern BOOL g_bBackfillRequested;
+
+// Real-time candle building settings
+extern BOOL g_bRealTimeCandlesEnabled;
+extern int g_nBackfillIntervalMs;
+
 // Global function declarations
 CString GetAvailableSymbols(void);
 CString BuildOpenAlgoURL(const CString& server, int port, const CString& endpoint);
