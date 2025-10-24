@@ -102,6 +102,13 @@ typedef CArray< struct Quotation, struct Quotation > CQuoteArray;
 BOOL g_bRealTimeCandlesEnabled = TRUE;  // Default: enabled
 int g_nBackfillIntervalMs = 5000;       // HTTP backfill every 5 seconds
 
+// HTTP response caching (performance optimization)
+// Cache HTTP responses to avoid calling HTTP API on every GetQuotesEx() call
+CMapStringToPtr g_HttpResponseCache;  // Maps "SYMBOL-PERIODICITY" → last HTTP call time (DWORD*)
+CRITICAL_SECTION g_HttpCacheCriticalSection;
+const DWORD HTTP_CACHE_LIFETIME_MS = 60000;  // Cache HTTP responses for 60 seconds
+static BOOL g_bHttpCacheCriticalSectionInitialized = FALSE;
+
 // BarBuilder: Per-symbol tick-to-bar aggregation state
 struct BarBuilder {
 	CString symbol;
@@ -1160,6 +1167,13 @@ PLUGINAPI int Init(void)
 		// Initialize BarBuilders hash table
 		g_BarBuilders.InitHashTable(503);  // Prime number for better distribution
 
+		// Initialize critical section for HTTP cache operations
+		InitializeCriticalSection(&g_HttpCacheCriticalSection);
+		g_bHttpCacheCriticalSectionInitialized = TRUE;
+
+		// Initialize HTTP response cache hash table
+		g_HttpResponseCache.InitHashTable(127);  // Prime number for better distribution
+
 		// Log real-time settings
 		CString rtMsg;
 		rtMsg.Format(_T("OpenAlgo: Real-Time Candles Enabled = %d, Backfill Interval = %d ms"),
@@ -1206,6 +1220,26 @@ PLUGINAPI int Release(void)
 	{
 		DeleteCriticalSection(&g_BarBuilderCriticalSection);
 		g_bBarBuilderCriticalSectionInitialized = FALSE;
+	}
+
+	if (g_bHttpCacheCriticalSectionInitialized)
+	{
+		// Clean up HTTP cache - free allocated memory
+		POSITION pos = g_HttpResponseCache.GetStartPosition();
+		while (pos != NULL)
+		{
+			CString key;
+			void* pValue;
+			g_HttpResponseCache.GetNextAssoc(pos, key, pValue);
+			if (pValue != NULL)
+			{
+				delete (DWORD*)pValue;
+			}
+		}
+		g_HttpResponseCache.RemoveAll();
+
+		DeleteCriticalSection(&g_HttpCacheCriticalSection);
+		g_bHttpCacheCriticalSectionInitialized = FALSE;
 	}
 
 	return 1;
@@ -1865,41 +1899,114 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 				OutputDebugString(_T("OpenAlgo: GetQuotesEx - BarBuilder found, entering critical section"));
 				EnterCriticalSection(&g_BarBuilderCriticalSection);
 
-				// ALWAYS fetch HTTP bars + append tick bar
-				// This ensures we always return complete, consistent data to AmiBroker
-				// HTTP call is fast (~100ms) and provides self-correcting behavior
-				OutputDebugString(_T("OpenAlgo: GetQuotesEx - Fetching HTTP backfill + tick bar..."));
+				// PERFORMANCE FIX: Use HTTP response caching to avoid calling HTTP API on every GetQuotesEx() call
+				// Check if we have a recent HTTP response cached (within last 60 seconds)
+				// For real-time updates, rely on WebSocket ticks (processed every 100ms by timer)
+				// Only fetch HTTP for initial load or periodic validation (every 60 seconds)
 
-				// Fetch HTTP backfill data (source of truth for completed bars)
-				int httpLastValid = GetOpenAlgoHistory(pszTicker, 60, nQty - 1, nSize, pQuotes);
+				CString cacheKey;
+				cacheKey.Format(_T("%s-%d"), pszTicker, 60);  // "RELIANCE-NSE-60"
 
-				CString httpLog;
-				httpLog.Format(_T("OpenAlgo: ===== HTTP API RESPONSE ====="));
-				OutputDebugString(httpLog);
-				httpLog.Format(_T("OpenAlgo: HTTP returned %d bars for %s"), httpLastValid, pszTicker);
-				OutputDebugString(httpLog);
+				DWORD currentTime = (DWORD)GetTickCount64();
+				BOOL bShouldCallHttp = TRUE;  // Default: call HTTP
+				int httpLastValid = nQty - 1;  // Start with existing bar count
 
-				// Log last 3 HTTP bars for debugging
-				if (httpLastValid > 0)
+				// Check cache
+				EnterCriticalSection(&g_HttpCacheCriticalSection);
+				void* pCacheValue = NULL;
+				if (g_HttpResponseCache.Lookup(cacheKey, pCacheValue) && pCacheValue != NULL)
 				{
-					int startIdx = max(0, httpLastValid - 3);
-					for (int i = startIdx; i < httpLastValid; i++)
+					DWORD lastHttpCallTime = *(DWORD*)pCacheValue;
+					DWORD timeSinceLastCall = currentTime - lastHttpCallTime;
+
+					if (timeSinceLastCall < HTTP_CACHE_LIFETIME_MS)
 					{
-						AmiDate barDate = pQuotes[i].DateTime;
-						CString barLog;
-						barLog.Format(_T("OpenAlgo: HTTP Bar[%d]: %04d-%02d-%02d %02d:%02d O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f"),
-							i, barDate.PackDate.Year, barDate.PackDate.Month, barDate.PackDate.Day,
-							barDate.PackDate.Hour, barDate.PackDate.Minute,
-							pQuotes[i].Open, pQuotes[i].High, pQuotes[i].Low, pQuotes[i].Price, pQuotes[i].Volume);
-						OutputDebugString(barLog);
+						// Cache is FRESH - SKIP HTTP call, use tick bars only
+						bShouldCallHttp = FALSE;
+
+						CString cacheLog;
+						cacheLog.Format(_T("OpenAlgo: GetQuotesEx - HTTP cache HIT (%.1f seconds old), skipping HTTP call"),
+							timeSinceLastCall / 1000.0f);
+						OutputDebugString(cacheLog);
+					}
+					else
+					{
+						// Cache is STALE - need to refresh
+						CString cacheLog;
+						cacheLog.Format(_T("OpenAlgo: GetQuotesEx - HTTP cache STALE (%.1f seconds old), calling HTTP"),
+							timeSinceLastCall / 1000.0f);
+						OutputDebugString(cacheLog);
 					}
 				}
+				else
+				{
+					// No cache entry - first call for this symbol
+					OutputDebugString(_T("OpenAlgo: GetQuotesEx - HTTP cache MISS (first call), calling HTTP"));
+				}
+				LeaveCriticalSection(&g_HttpCacheCriticalSection);
 
-				// CRITICAL FIX: Remove corrupted bar and duplicate timestamps from HTTP response
-				// The HTTP API has TWO bugs:
-				// 1. Returns corrupted last bar with invalid timestamp (Hour=31, Minute=63)
-				// 2. Keeps adding bars with same timestamp instead of updating
+				// Call HTTP API if needed
+				if (bShouldCallHttp)
+				{
+					OutputDebugString(_T("OpenAlgo: GetQuotesEx - Fetching HTTP backfill..."));
+
+					// Fetch HTTP backfill data (source of truth for completed bars)
+					httpLastValid = GetOpenAlgoHistory(pszTicker, 60, nQty - 1, nSize, pQuotes);
+
+					// Update cache with current time
+					EnterCriticalSection(&g_HttpCacheCriticalSection);
+					if (pCacheValue != NULL)
+					{
+						// Update existing cache entry
+						*(DWORD*)pCacheValue = currentTime;
+					}
+					else
+					{
+						// Create new cache entry
+						DWORD* pNewTime = new DWORD;
+						*pNewTime = currentTime;
+						g_HttpResponseCache.SetAt(cacheKey, pNewTime);
+					}
+					LeaveCriticalSection(&g_HttpCacheCriticalSection);
+				}
+				else
+				{
+					// Skip HTTP call - will use existing bars + tick bars
+					httpLastValid = nQty - 1;
+				}
+
+				// Only process HTTP response if we actually called HTTP
 				int cleanedBarCount = httpLastValid;
+
+				if (bShouldCallHttp)
+				{
+					CString httpLog;
+					httpLog.Format(_T("OpenAlgo: ===== HTTP API RESPONSE ====="));
+					OutputDebugString(httpLog);
+					httpLog.Format(_T("OpenAlgo: HTTP returned %d bars for %s"), httpLastValid, pszTicker);
+					OutputDebugString(httpLog);
+
+					// Log last 3 HTTP bars for debugging
+					if (httpLastValid > 0)
+					{
+						int startIdx = max(0, httpLastValid - 3);
+						for (int i = startIdx; i < httpLastValid; i++)
+						{
+							AmiDate barDate = pQuotes[i].DateTime;
+							CString barLog;
+							barLog.Format(_T("OpenAlgo: HTTP Bar[%d]: %04d-%02d-%02d %02d:%02d O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f"),
+								i, barDate.PackDate.Year, barDate.PackDate.Month, barDate.PackDate.Day,
+								barDate.PackDate.Hour, barDate.PackDate.Minute,
+								pQuotes[i].Open, pQuotes[i].High, pQuotes[i].Low, pQuotes[i].Price, pQuotes[i].Volume);
+							OutputDebugString(barLog);
+						}
+					}
+
+					// CRITICAL FIX: Remove corrupted bar and duplicate timestamps from HTTP response
+					// The HTTP API has TWO bugs:
+					// 1. Returns corrupted last bar with invalid timestamp (Hour=31, Minute=63)
+					// 2. Keeps adding bars with same timestamp instead of updating
+					cleanedBarCount = httpLastValid;
 
 				// STEP 1: Remove corrupted last bar if present
 				if (httpLastValid >= 1)
@@ -1998,9 +2105,13 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 					delete[] keepBar;
 				}
 
-				httpLastValid = cleanedBarCount;
-				httpLog.Format(_T("OpenAlgo: After cleanup: %d bars (removed corrupted + duplicates)"), httpLastValid);
-				OutputDebugString(httpLog);
+					httpLastValid = cleanedBarCount;
+
+					CString cleanupLog;
+					cleanupLog.Format(_T("OpenAlgo: After cleanup: %d bars (removed corrupted + duplicates)"), httpLastValid);
+					OutputDebugString(cleanupLog);
+				}
+				// End of HTTP response processing
 
 				// Log tick bar data for debugging
 				if (pBuilder->bBarStarted)

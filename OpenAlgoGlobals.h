@@ -33,6 +33,12 @@ extern BOOL g_bBackfillRequested;
 extern BOOL g_bRealTimeCandlesEnabled;
 extern int g_nBackfillIntervalMs;
 
+// HTTP response caching (performance optimization)
+// Cache HTTP responses to avoid calling HTTP API on every GetQuotesEx() call
+extern CMapStringToPtr g_HttpResponseCache;  // Maps "SYMBOL-PERIODICITY" → last HTTP response time (DWORD*)
+extern CRITICAL_SECTION g_HttpCacheCriticalSection;
+extern const DWORD HTTP_CACHE_LIFETIME_MS;  // How long to cache HTTP responses (default: 60000ms = 60 seconds)
+
 // Global function declarations
 CString GetAvailableSymbols(void);
 CString BuildOpenAlgoURL(const CString& server, int port, const CString& endpoint);
