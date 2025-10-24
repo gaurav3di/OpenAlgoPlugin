@@ -1483,8 +1483,10 @@ VOID CALLBACK OnTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
 	// High-frequency WebSocket data processing timer (every 100ms)
 	if (idEvent == TIMER_WEBSOCKET)
 	{
-		// Process WebSocket data if real-time candles are enabled
-		if (g_bRealTimeCandlesEnabled && g_bWebSocketConnected)
+		// ALWAYS call ProcessWebSocketData() if real-time candles are enabled
+		// ProcessWebSocketData() has its own auto-reconnect logic when disconnected
+		// DO NOT check g_bWebSocketConnected here, or auto-reconnect will never run!
+		if (g_bRealTimeCandlesEnabled)
 		{
 			ProcessWebSocketData();
 		}
